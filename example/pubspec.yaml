@@ -4,8 +4,8 @@ version: 1.0.0+1
 publish_to: none
 
 environment:
-  sdk: ">=3.6.0 <4.0.0"
-  flutter: ">=3.27.0"
+  sdk: ">=3.5.0 <4.0.0"
+  flutter: ">=3.24.0"
 
 dependencies:
   device_info_plus: ^11.2.1
@@ -19,7 +19,7 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  leancode_lint: ^15.0.0
+  leancode_lint: ^14.3.0
 
 flutter:
   uses-material-design: true

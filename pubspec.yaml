@@ -15,8 +15,8 @@ flutter:
         pluginClass: FlutterDownloaderPlugin
 
 environment:
-  sdk: ">=3.6.0 <4.0.0"
-  flutter: ">=3.27.0"
+  sdk: ">=3.5.0 <4.0.0"
+  flutter: ">=3.24.0"
 
 dependencies:
   flutter:
@@ -25,4 +25,4 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  leancode_lint: ^15.0.0
+  leancode_lint: ^14.3.0

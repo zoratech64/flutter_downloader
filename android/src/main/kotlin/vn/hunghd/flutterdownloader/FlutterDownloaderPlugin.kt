@@ -252,11 +252,18 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
 
     private fun pause(call: MethodCall, result: MethodChannel.Result) {
         val taskId: String = call.requireArgument("task_id")
-        // mark the current task is cancelled to process pause request
-        // the worker will depends on this flag to prepare data for resume request
+
+        // Mark task as paused in the database, so the worker knows it's paused (not canceled)
         taskDao!!.updateTask(taskId, true)
-        // cancel running task, this method causes WorkManager.isStopped() turning true and the download loop will be stopped
-        WorkManager.getInstance(requireContext()).cancelWorkById(UUID.fromString(taskId))
+
+        // Instead of canceling the WorkManager task, send a broadcast to pause it gracefully
+        val pauseIntent = Intent(DownloadWorker.ACTION_PAUSE).apply {
+            setPackage(requireContext().packageName)
+            // Optionally put taskId to identify which task to pause if needed
+            putExtra("TASK_ID", taskId)
+        }
+        requireContext().sendBroadcast(pauseIntent)
+
         result.success(null)
     }
 
