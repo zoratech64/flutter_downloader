@@ -213,7 +213,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     return task.taskDescription;
 }
 
-- (void)updateRunningTaskById:(NSString*)taskId progress:(int)progress status:(int)status resumable:(BOOL)resumable {
+- (void)updateRunningTaskById:(NSString*)taskId progress:(double)progress status:(int)status resumable:(BOOL)resumable {
     _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
     _runningTaskById[taskId][KEY_STATUS] = @(status);
     _runningTaskById[taskId][KEY_RESUMABLE] = @(resumable);
@@ -233,7 +233,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
                 NSDictionary *task = [weakSelf loadTaskWithId:taskIdValue];
               
                 NSNumber *progressNumOfTask = task[@"progress"];
-                int progress = progressNumOfTask.intValue;
+                double progress = progressNumOfTask.doubleValue;
                 
                 [download cancelByProducingResumeData:^(NSData * _Nullable resumeData) {
                     // Save partial downloaded data to a file
@@ -495,7 +495,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     }
 }
 
-- (void) updateTask: (NSString*) taskId status: (int) status progress: (int) progress
+- (void) updateTask: (NSString*) taskId status: (int) status progress: (double) progress
 {
 
     NSString *query = @"UPDATE task SET status = ?, progress = ? WHERE task_id = ?";
@@ -535,7 +535,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 
 - (void)updateTask:(NSString *)taskId
              status:(int)status
-           progress:(int)progress
+           progress:(double)progress
           resumable:(BOOL)resumable {
     
     NSString *query = @"UPDATE task SET status = ?, progress = ?, resumable = ? WHERE task_id = ?";
@@ -1091,7 +1091,7 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
         NSString *taskId = [self identifierForTask:downloadTask];
         int progress = round(totalBytesWritten * 100 / (double)totalBytesExpectedToWrite);
         NSNumber *lastProgress = _runningTaskById[taskId][KEY_PROGRESS];
-        if (([lastProgress intValue] == 0 || (progress > ([lastProgress intValue] + _step)) || progress == 100) && progress != [lastProgress intValue]) {
+        if (([lastProgress doubleValue] == 0 || (progress > ([lastProgress doubleValue] + _step)) || progress == 100) && progress != [lastProgress doubleValue]) {
             
             NSNumber *status;
             if (downloadTask.state == NSURLSessionTaskStateRunning) {

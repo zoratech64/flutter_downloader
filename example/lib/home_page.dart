@@ -64,7 +64,7 @@ class _MyHomePageState extends State<MyHomePage> {
     _port.listen((dynamic data) {
       final taskId = (data as List<dynamic>)[0] as String;
       final status = DownloadTaskStatus.fromInt(data[1] as int);
-      final progress = data[2] as int;
+      final progress = data[2] as double;
 
       print(
         'Callback on UI isolate: '
@@ -100,7 +100,7 @@ class _MyHomePageState extends State<MyHomePage> {
   static void downloadCallback(
     String id,
     int status,
-    int progress,
+    double progress,
   ) {
     print(
       'Callback on background isolate: '
@@ -297,7 +297,6 @@ class _MyHomePageState extends State<MyHomePage> {
   Future<void> _prepare() async {
     await Permission.notification.request();
     await Permission.storage.request();
-    await Permission.manageExternalStorage.request();
 
     final tasks = await FlutterDownloader.loadTasks();
 
@@ -447,6 +446,6 @@ class TaskInfo {
   final String? link;
 
   String? taskId;
-  int? progress = 0;
+  double? progress = 0;
   DownloadTaskStatus? status = DownloadTaskStatus.undefined;
 }
