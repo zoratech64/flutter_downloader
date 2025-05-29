@@ -68,7 +68,7 @@ class DownloadTask {
   final DownloadTaskStatus status;
 
   /// Progress between 0 (inclusive) and 100 (inclusive).
-  final int progress;
+  final double progress;
 
   /// URL from which the file is downloaded.
   final String url;

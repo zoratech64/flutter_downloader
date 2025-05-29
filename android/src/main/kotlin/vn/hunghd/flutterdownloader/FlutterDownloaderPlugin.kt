@@ -129,7 +129,7 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
             .build()
     }
 
-    private fun sendUpdateProgress(id: String, status: DownloadStatus, progress: Int) {
+    private fun sendUpdateProgress(id: String, status: DownloadStatus, progress: Double) {
         val args: MutableMap<String, Any> = HashMap()
         args["task_id"] = id
         args["status"] = status.ordinal
@@ -186,12 +186,12 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
         WorkManager.getInstance(requireContext()).enqueue(request)
         val taskId: String = request.id.toString()
         result.success(taskId)
-        sendUpdateProgress(taskId, DownloadStatus.ENQUEUED, 0)
+        sendUpdateProgress(taskId, DownloadStatus.ENQUEUED, 0.0)
         taskDao!!.insertOrUpdateNewTask(
             taskId,
             url,
             DownloadStatus.ENQUEUED,
-            0,
+            0.0,
             filename,
             savedDir,
             headers,

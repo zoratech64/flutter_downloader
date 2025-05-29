@@ -17,7 +17,7 @@ import 'models.dart';
 typedef DownloadCallback = void Function(
   String id,
   int status,
-  int progress,
+  double progress,
 );
 
 /// Provides access to all functions of the plugin in a single place.
@@ -155,7 +155,7 @@ class FlutterDownloader {
           return DownloadTask(
             taskId: item['task_id'] as String,
             status: DownloadTaskStatus.fromInt(item['status'] as int),
-            progress: item['progress'] as int,
+            progress: item['progress'] as double,
             url: item['url'] as String,
             filename: item['file_name'] as String?,
             savedDir: item['saved_dir'] as String,
@@ -213,7 +213,7 @@ class FlutterDownloader {
           return DownloadTask(
             taskId: item['task_id'] as String,
             status: DownloadTaskStatus.fromInt(item['status'] as int),
-            progress: item['progress'] as int,
+            progress: item['progress'] as double,
             url: item['url'] as String,
             filename: item['file_name'] as String?,
             savedDir: item['saved_dir'] as String,
@@ -301,7 +301,7 @@ class FlutterDownloader {
   static Future<String?> retry({
     required String taskId,
     bool requiresStorageNotLow = true,
-    int timeout = 15000,
+    int timeout = 100000,
   }) async {
     assert(_initialized, 'plugin flutter_downloader is not initialized');
 

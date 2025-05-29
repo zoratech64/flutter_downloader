@@ -64,7 +64,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
     private var clickToOpenDownloadedFile = false
     private var debug = false
     private var ignoreSsl = false
-    private var lastProgress = 0
+    private var lastProgress = 0.0
     private var primaryId = 0
     private var msgStarted: String? = null
     private var msgInProgress: String? = null
@@ -179,7 +179,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         val filename: String? = inputData.getString(ARG_FILE_NAME)
         val task = taskDao?.loadTask(id.toString())
         if (task != null && task.status == DownloadStatus.ENQUEUED) {
-            updateNotification(context, filename ?: url, DownloadStatus.CANCELED, -1, null, true)
+            updateNotification(context, filename ?: url, DownloadStatus.CANCELED, -1.0, null, true)
             taskDao?.updateTask(id.toString(), DownloadStatus.CANCELED, lastProgress)
         }
         super.onStopped()
@@ -261,7 +261,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 applicationContext,
                 filename ?: url,
                 DownloadStatus.FAILED,
-                -1,
+                -1.0,
                 null,
                 true
             )
@@ -465,14 +465,14 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                         break
                     }
                     count += bytesRead.toLong()
-                    val progress = (count * 100 / (contentLength + downloadedBytes)).toInt()
+                    val progress = (count * 100.0 / (contentLength + downloadedBytes)).coerceAtMost(100.0)
                     outputStream?.write(buffer, 0, bytesRead)
 
-                    if ((lastProgress == 0 || progress > lastProgress + step || progress == 100) &&
+                    if ((lastProgress == 0.0 || progress > lastProgress + step || progress == 100.0) &&
                         progress != lastProgress
                     ) {
                         lastProgress = progress
-                        taskDao!!.updateTask(id.toString(), DownloadStatus.RUNNING, progress)
+                        taskDao!!.updateTask(id.toString(), DownloadStatus.RUNNING, progress.toDouble())
                         updateNotification(
                             context,
                             actualFilename,
@@ -485,7 +485,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 }
 
                 val loadedTask = taskDao?.loadTask(id.toString())
-                val progress = if (isStopped && loadedTask!!.resumable) lastProgress else 100
+                val progress = if (isStopped && loadedTask!!.resumable) lastProgress else 100.0
                 val status = if (isStopped)
                     if (loadedTask!!.resumable) DownloadStatus.PAUSED else DownloadStatus.CANCELED
                 else
@@ -538,7 +538,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                     DownloadStatus.FAILED
 
                 taskDao!!.updateTask(id.toString(), status, lastProgress)
-                updateNotification(context, actualFilename ?: fileURL, status, -1, null, true)
+                updateNotification(context, actualFilename ?: fileURL, status, -1.0, null, true)
                 log(if (isStopped) "Download canceled or paused" else "Server replied HTTP code: $responseCode")
             }
         } catch (e: IOException) {
@@ -547,7 +547,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 context,
                 actualFilename ?: fileURL,
                 DownloadStatus.FAILED,
-                -1,
+                -1.0,
                 null,
                 true
             )
@@ -689,7 +689,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         context: Context,
         title: String?,
         status: DownloadStatus,
-        progress: Int,
+        progress: Double,
         intent: PendingIntent?,
         finalize: Boolean,
         progressText: String? = null
@@ -731,7 +731,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                         .setSmallIcon(notificationIconRes)
                 } else if (progress < 100) {
                     builder.setContentText(msgInProgress)
-                        .setProgress(100, progress, false)
+                        .setProgress(100, progress.toInt(), false)
                     builder.setOngoing(true).setAutoCancel(false)
                         .setSmallIcon(android.R.drawable.stat_sys_download)
                     builder.addAction(
@@ -805,7 +805,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         lastCallUpdateNotification = System.currentTimeMillis()
     }
 
-    private fun sendUpdateProcessEvent(status: DownloadStatus, progress: Int) {
+    private fun sendUpdateProcessEvent(status: DownloadStatus, progress: Double) {
         val args: MutableList<Any> = ArrayList()
         val callbackHandle: Long = inputData.getLong(ARG_CALLBACK_HANDLE, 0)
         args.add(callbackHandle)

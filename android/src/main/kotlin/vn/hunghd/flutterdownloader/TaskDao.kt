@@ -28,7 +28,7 @@ class TaskDao(private val dbHelper: TaskDbHelper) {
         taskId: String?,
         url: String?,
         status: DownloadStatus,
-        progress: Int,
+        progress: Double,
         fileName: String?,
         savedDir: String?,
         headers: String?,
@@ -124,7 +124,7 @@ class TaskDao(private val dbHelper: TaskDbHelper) {
         return result
     }
 
-    fun updateTask(taskId: String, status: DownloadStatus, progress: Int) {
+    fun updateTask(taskId: String, status: DownloadStatus, progress: Double) {
         val db = dbHelper.writableDatabase
         val values = ContentValues()
         values.put(TaskEntry.COLUMN_NAME_STATUS, status.ordinal)
@@ -149,7 +149,7 @@ class TaskDao(private val dbHelper: TaskDbHelper) {
         currentTaskId: String,
         newTaskId: String?,
         status: DownloadStatus,
-        progress: Int,
+        progress: Double,
         resumable: Boolean
     ) {
         val db = dbHelper.writableDatabase
@@ -243,7 +243,7 @@ class TaskDao(private val dbHelper: TaskDbHelper) {
         val primaryId = cursor.getInt(cursor.getColumnIndexOrThrow(BaseColumns._ID))
         val taskId = cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_TASK_ID))
         val status = cursor.getInt(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_STATUS))
-        val progress = cursor.getInt(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_PROGRESS))
+        val progress = cursor.getDouble(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_PROGRESS))
         val url = cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_URL))
         val filename = cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_FILE_NAME))
         val savedDir = cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_SAVED_DIR))

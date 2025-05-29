@@ -4,7 +4,7 @@ data class DownloadTask(
     var primaryId: Int,
     var taskId: String,
     var status: DownloadStatus,
-    var progress: Int,
+    var progress: Double,
     var url: String,
     var filename: String?,
     var savedDir: String,
