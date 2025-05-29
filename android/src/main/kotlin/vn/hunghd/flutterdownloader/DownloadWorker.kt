@@ -76,6 +76,10 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
     private var step = 0
     private var saveInPublicStorage = false
 
+    private var downloadStartTime: Long = 0
+    private var downloadedBytesSoFar: Long = 0
+    private var lastUpdateTime: Long = 0
+
     // --- ADDED: Track pause state ---
     private var isPaused = false
     private var isStopped = false
@@ -209,6 +213,8 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         msgFailed = res.getString(R.string.flutter_downloader_notification_failed)
         msgPaused = res.getString(R.string.flutter_downloader_notification_paused)
         msgComplete = res.getString(R.string.flutter_downloader_notification_complete)
+        downloadStartTime = System.currentTimeMillis()
+        lastUpdateTime = downloadStartTime
         val task = taskDao?.loadTask(id.toString())
         log(
             "DownloadWorker{url=$url,filename=$filename,savedDir=$savedDir,header=$headers,isResume=$isResume,status=" + (
@@ -228,7 +234,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         setupNotification(applicationContext)
         updateNotification(
             applicationContext,
-            filename ?: url,
+            filename ?: "Starting Download...",
             DownloadStatus.RUNNING,
             task.progress,
             null,
@@ -259,7 +265,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         } catch (e: Exception) {
             updateNotification(
                 applicationContext,
-                filename ?: url,
+                filename ?: "Download failed",
                 DownloadStatus.FAILED,
                 -1.0,
                 null,
@@ -472,14 +478,41 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                         progress != lastProgress
                     ) {
                         lastProgress = progress
-                        taskDao!!.updateTask(id.toString(), DownloadStatus.RUNNING, progress.toDouble())
+                        downloadedBytesSoFar = count
+                        val currentTime = System.currentTimeMillis()
+                        val timeElapsed = currentTime - downloadStartTime // ms
+                        val speedBytesPerSec = if (timeElapsed > 0) (downloadedBytesSoFar * 1000 / timeElapsed) else 0
+                        val remainingBytes = (contentLength + downloadedBytes) - downloadedBytesSoFar
+                        val estimatedRemainingTimeSec = if (speedBytesPerSec > 0) (remainingBytes / speedBytesPerSec) else -1
+
+                        val speedText = if (speedBytesPerSec > 0) {
+                            val speedKB = speedBytesPerSec / 1024.0
+                            if (speedKB >= 1024) {
+                                val speedMB = speedKB / 1024.0
+                                String.format(Locale.US, "%.2f MB/s", speedMB)
+                            } else {
+                                String.format(Locale.US, "%.0f KB/s", speedKB)
+                            }
+                        } else {
+                            "Calculating..."
+                        }
+
+                        val timeText = if (estimatedRemainingTimeSec >= 0)
+                            formatRemainingTime(estimatedRemainingTimeSec)
+                        else
+                            "Unknown time left"
+
+                        val progressText = "$speedText · $timeText"
+
+                        taskDao!!.updateTask(id.toString(), DownloadStatus.RUNNING, progress)
                         updateNotification(
                             context,
                             actualFilename,
                             DownloadStatus.RUNNING,
                             progress,
                             null,
-                            false
+                            false,
+                            progressText
                         )
                     }
                 }
@@ -545,7 +578,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             taskDao!!.updateTask(id.toString(), DownloadStatus.FAILED, lastProgress)
             updateNotification(
                 context,
-                actualFilename ?: fileURL,
+                actualFilename ?: "Download failed",
                 DownloadStatus.FAILED,
                 -1.0,
                 null,
@@ -557,6 +590,16 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             outputStream?.close()
             inputStream?.close()
             httpConn?.disconnect()
+        }
+    }
+
+    private fun formatRemainingTime(seconds: Long): String {
+        val minutes = seconds / 60
+        val secs = seconds % 60
+        return if (minutes > 0) {
+            "${minutes}m ${secs}s left"
+        } else {
+            "${secs}s left"
         }
     }
 
@@ -722,6 +765,8 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val progressPercentage = String.format(Locale.US, "%.2f%%", progress)
+
         when (status) {
             DownloadStatus.RUNNING -> {
                 if (progress <= 0) {
@@ -730,7 +775,11 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                     builder.setOngoing(true).setAutoCancel(false)
                         .setSmallIcon(notificationIconRes)
                 } else if (progress < 100) {
-                    builder.setContentText(msgInProgress)
+                    val finalProgressText = if (progressText != null)
+                        "$msgInProgress - $progressPercentage - $progressText"
+                    else
+                        "$msgInProgress - $progressPercentage"
+                    builder.setContentText(finalProgressText)
                         .setProgress(100, progress.toInt(), false)
                     builder.setOngoing(true).setAutoCancel(false)
                         .setSmallIcon(android.R.drawable.stat_sys_download)
@@ -752,7 +801,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             }
 
             DownloadStatus.PAUSED -> {
-                builder.setContentText(msgPaused).setProgress(0, 0, false)
+                builder.setContentText("$msgPaused - $progressPercentage").setProgress(0, 0, false)
                 builder.setOngoing(true).setAutoCancel(false)
                     .setSmallIcon(android.R.drawable.ic_media_pause)
                 builder.addAction(android.R.drawable.ic_media_play, "Resume", resumePendingIntent)
@@ -947,7 +996,6 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 lastProgress,
                 null,
                 false,
-
             )
         }
     }
