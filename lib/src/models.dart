@@ -106,6 +106,32 @@ class DownloadTask {
         other.allowCellular == allowCellular;
   }
 
+  /// Returns a copy of this [DownloadTask] with the given fields updated.
+  ///
+  /// All parameters are optional. If a parameter is not provided,
+  /// the current value of that field in the instance will be used.
+  DownloadTask copyWith({
+    String? taskId,
+    DownloadTaskStatus? status,
+    double? progress,
+    String? url,
+    String? filename,
+    String? savedDir,
+    int? timeCreated,
+    bool? allowCellular,
+  }) {
+    return DownloadTask(
+      taskId: taskId ?? this.taskId,
+      status: status ?? this.status,
+      progress: progress ?? this.progress,
+      url: url ?? this.url,
+      filename: filename ?? this.filename,
+      savedDir: savedDir ?? this.savedDir,
+      timeCreated: timeCreated ?? this.timeCreated,
+      allowCellular: allowCellular ?? this.allowCellular,
+    );
+  }
+
   @override
   int get hashCode {
     return Object.hash(
