@@ -408,8 +408,27 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
     var responseCode: Int
     var times: Int
 
+    // 0) Grab the “old” task ID (if this is a resume) so we can keep sending progress under that ID.
+    val oldTaskId: String? = inputData.getString("OLD_TASK_ID")
+
+    // Helper that sends progress using either oldTaskId or the new WorkRequest ID
+    fun sendProgress(status: DownloadStatus, progress: Double) {
+        val taskIdToUse = oldTaskId ?: id.toString()
+        val callbackHandle: Long = inputData.getLong(ARG_CALLBACK_HANDLE, 0L)
+        val args = listOf<Any>(callbackHandle, taskIdToUse, status.ordinal, progress)
+        synchronized(isolateStarted) {
+            if (!isolateStarted.get()) {
+                isolateQueue.add(args)
+            } else {
+                Handler(applicationContext.mainLooper).post {
+                    backgroundChannel?.invokeMethod("updateProgress", args)
+                }
+            }
+        }
+    }
+
     try {
-        // Load current progress from DB
+        // Load current progress from DB (for lastProgress)
         val task = taskDao?.loadTask(id.toString())
         if (task != null) {
             lastProgress = task.progress
@@ -500,7 +519,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 null,
                 true
             )
-            sendUpdateProcessEvent(DownloadStatus.COMPLETE, 100.0)
+            sendProgress(DownloadStatus.COMPLETE, 100.0)
             return
         }
         // ────────────────────────────────────────────────────────────────────────────────
@@ -632,7 +651,8 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                         false,
                         progressText
                     )
-                    sendUpdateProcessEvent(DownloadStatus.RUNNING, progress)
+                    // Replace old call with our helper
+                    sendProgress(DownloadStatus.RUNNING, progress)
                 }
             }
 
@@ -640,7 +660,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             val loadedTask = taskDao?.loadTask(id.toString())
             val finalProgress = if (isStopped && loadedTask!!.resumable) lastProgress else 100.0
             val finalStatus = if (isStopped) {
-                if (loadedTask!!.resumable) DownloadStatus.PAUSED else DownloadStatus.CANCELED
+                if (loadedTask?.resumable == true) DownloadStatus.PAUSED else DownloadStatus.CANCELED
             } else {
                 DownloadStatus.COMPLETE
             }
@@ -715,12 +735,14 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 pendingIntent,
                 true
             )
+            // Final callback under the correct ID
+            sendProgress(finalStatus, finalProgress)
             log(if (isStopped) "Download canceled/paused" else "Download complete")
         } else {
             // Canceled or unexpected response code
             val loadedTask = taskDao!!.loadTask(id.toString())
             val status = if (isStopped)
-                if (loadedTask!!.resumable) DownloadStatus.PAUSED else DownloadStatus.CANCELED
+                if (loadedTask?.resumable == true) DownloadStatus.PAUSED else DownloadStatus.CANCELED
             else
                 DownloadStatus.FAILED
 
@@ -733,6 +755,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 null,
                 true
             )
+            sendProgress(status, -1.0)
             log(
                 if (isStopped) "Download canceled/paused"
                 else "HTTP $responseCode, marked FAILED"
@@ -748,6 +771,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             null,
             true
         )
+        sendProgress(DownloadStatus.FAILED, -1.0)
         e.printStackTrace()
     } finally {
         outputStream?.flush()
@@ -756,6 +780,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         httpConn?.disconnect()
     }
 }
+
 
 
 
@@ -1309,6 +1334,10 @@ private fun resumeDownload(intent: Intent) {
         .putBoolean(ARG_SAVE_IN_PUBLIC_STORAGE, originalSaveInPublic)
         .putBoolean("allow_cellular", originalAllowCellular)
         .putInt(ARG_TIMEOUT, timeoutMs)
+
+        // <— Add this line to carry the old (paused) task ID forward:
+        .putString("OLD_TASK_ID", pausedTaskId)
+
         .build()
 
     // 7) Recreate exactly the same Constraints:
