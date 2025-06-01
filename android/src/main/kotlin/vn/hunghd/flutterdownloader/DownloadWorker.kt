@@ -18,15 +18,13 @@ import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
-import androidx.work.Worker
-import androidx.work.WorkerParameters
+import androidx.work.*
 import io.flutter.FlutterInjector
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.dart.DartExecutor
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.FlutterCallbackInformation
-import org.json.JSONException
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -40,6 +38,7 @@ import java.net.URLDecoder
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.util.ArrayDeque
+import java.util.HashMap
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.regex.Pattern
@@ -48,18 +47,37 @@ import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
+import java.util.concurrent.TimeUnit
+import java.util.UUID
 
+/**
+ * DownloadWorker.kt
+ *
+ * When a WorkManager worker runs, it opens an HTTP connection, streams bytes to a file,
+ * updates a notification (with Pause/Resume/Cancel buttons), and reports progress/status
+ * back to Dart via `backgroundChannel.invokeMethod("updateProgress", args)`.
+ *
+ * We do NOT call PluginUtilities.getCallbackFromHandle(...) here; instead, Dart listens
+ * for “updateProgress” on its background channel and dispatches to the user’s callback.
+ */
 class DownloadWorker(context: Context, params: WorkerParameters) :
     Worker(context, params),
     MethodChannel.MethodCallHandler {
 
+    // Patterns for parsing charset and filename from headers
     private val charsetPattern = Pattern.compile("(?i)\\bcharset=\\s*\"?([^\\s;\"]*)")
     private val filenameStarPattern =
         Pattern.compile("(?i)\\bfilename\\*=([^']+)'([^']*)'\"?([^\"]+)\"?")
     private val filenamePattern = Pattern.compile("(?i)\\bfilename=\"?([^\"]+)\"?")
+
+    // Flutter background channel (to report progress back to Dart)
     private var backgroundChannel: MethodChannel? = null
+
+    // Database helpers
     private var dbHelper: TaskDbHelper? = null
     private var taskDao: TaskDao? = null
+
+    // Notification / state flags
     private var showNotification = false
     private var clickToOpenDownloadedFile = false
     private var debug = false
@@ -76,46 +94,51 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
     private var step = 0
     private var saveInPublicStorage = false
 
+    // Download speed / remaining time tracking
     private var downloadStartTime: Long = 0
     private var downloadedBytesSoFar: Long = 0
     private var lastUpdateTime: Long = 0
 
-    // --- ADDED: Track pause state ---
+    // --- Track pause/cancel state ---
     private var isPaused = false
     private var isStopped = false
 
-    // --- ADDED: BroadcastReceiver for notification button actions ---
+    // BroadcastReceiver for “Pause / Resume / Cancel” button clicks in the notification
     private val downloadActionReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent == null) return
-            when (intent.action) {
-                ACTION_PAUSE -> pauseDownload()
-                ACTION_RESUME -> resumeDownload()
-                ACTION_CANCEL -> cancelDownload()
-            }
+    override fun onReceive(context: Context?, intent: Intent?) {
+        if (intent == null) return
+        when (intent.action) {
+            ACTION_PAUSE  -> pauseDownload()
+            ACTION_RESUME -> resumeDownload(intent)   // pass the Intent along
+            ACTION_CANCEL -> cancelDownload()
         }
     }
+}
 
+    /**
+     * Starts (or reuses) a headless FlutterEngine so we can send progress updates
+     * back to Dart even if the app is in the background.  The Dart entrypoint
+     * (callbackDispatcher) was already registered during plugin.initialize() on the Dart side.
+     */
     private fun startBackgroundIsolate(context: Context) {
         synchronized(isolateStarted) {
             if (backgroundFlutterEngine == null) {
-                val pref: SharedPreferences = context.getSharedPreferences(
-                    FlutterDownloaderPlugin.SHARED_PREFERENCES_KEY,
-                    Context.MODE_PRIVATE
-                )
+                val pref: SharedPreferences =
+                    context.getSharedPreferences(
+                        FlutterDownloaderPlugin.SHARED_PREFERENCES_KEY,
+                        Context.MODE_PRIVATE
+                    )
                 val callbackHandle: Long = pref.getLong(
                     FlutterDownloaderPlugin.CALLBACK_DISPATCHER_HANDLE_KEY,
                     0
                 )
                 backgroundFlutterEngine = FlutterEngine(applicationContext, null, false)
 
-                // We need to create an instance of `FlutterEngine` before looking up the
-                // callback. If we don't, the callback cache won't be initialized and the
-                // lookup will fail.
+                // Look up the Dart callback (callbackDispatcher) from the handle we stored earlier.
                 val flutterCallback: FlutterCallbackInformation? =
                     FlutterCallbackInformation.lookupCallbackInformation(callbackHandle)
                 if (flutterCallback == null) {
-                    log("Fatal: failed to find callback")
+                    log("Fatal: failed to find callbackDispatcher")
                     return
                 }
                 val appBundlePath: String =
@@ -136,14 +159,13 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         )
         backgroundChannel?.setMethodCallHandler(this)
 
-        // --- ADDED: Register receiver for notification actions ---
+        // Register our BroadcastReceiver so “Pause / Resume / Cancel” intents get delivered
         val filter = IntentFilter().apply {
             addAction(ACTION_PAUSE)
             addAction(ACTION_RESUME)
             addAction(ACTION_CANCEL)
         }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {  // Android 13+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             applicationContext.registerReceiver(
                 downloadActionReceiver,
                 filter,
@@ -155,10 +177,13 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
-        if (call.method.equals("didInitializeDispatcher")) {
+        // We only expect to receive "didInitializeDispatcher" from Dart to signal
+        // that the Dart background isolate is up and running.  Once we see it,
+        // we drain the queued arguments (if any).
+        if (call.method == "didInitializeDispatcher") {
             synchronized(isolateStarted) {
                 while (!isolateQueue.isEmpty()) {
-                    backgroundChannel?.invokeMethod("", isolateQueue.remove())
+                    backgroundChannel?.invokeMethod("", isolateQueue.removeFirst())
                 }
                 isolateStarted.set(true)
                 result.success(null)
@@ -168,12 +193,15 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         }
     }
 
-    // --- MODIFIED: unregister receiver when stopped ---
+    /**
+     * If the system kills our Worker (e.g. user pauses or cancels), we unregister
+     * the BroadcastReceiver so we don’t leak it.
+     */
     override fun onStopped() {
         try {
             applicationContext.unregisterReceiver(downloadActionReceiver)
         } catch (e: IllegalArgumentException) {
-            // Receiver not registered or already unregistered
+            // Receiver wasn’t registered or already unregistered
         }
 
         val context: Context = applicationContext
@@ -183,29 +211,45 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         val filename: String? = inputData.getString(ARG_FILE_NAME)
         val task = taskDao?.loadTask(id.toString())
         if (task != null && task.status == DownloadStatus.ENQUEUED) {
-            updateNotification(context, filename ?: url, DownloadStatus.CANCELED, -1.0, null, true)
+            updateNotification(
+                context,
+                filename ?: url,
+                DownloadStatus.CANCELED,
+                -1.0,
+                null,
+                true
+            )
             taskDao?.updateTask(id.toString(), DownloadStatus.CANCELED, lastProgress)
         }
         super.onStopped()
     }
 
+    /**
+     * This is the “main” WorkManager entry point.  We:
+     * 1. Read all the arguments (URL, savedDir, headers, isResume, etc.)
+     * 2. If “isResume = true”, we add a “Range:” header to pick up where we left off.
+     * 3. Download bytes in a loop, writing to a partial file (append mode if resuming).
+     * 4. On every “step”% or on finish, we call updateNotification(...)
+     * 5. We also call sendUpdateProcessEvent(...) to push status/progress back to Dart.
+     */
     override fun doWork(): Result {
         dbHelper = TaskDbHelper.getInstance(applicationContext)
         taskDao = TaskDao(dbHelper!!)
         val url: String =
             inputData.getString(ARG_URL)
                 ?: throw IllegalArgumentException("Argument '$ARG_URL' should not be null")
-        val filename: String? =
-            inputData.getString(ARG_FILE_NAME) // ?: throw IllegalArgumentException("Argument '$ARG_FILE_NAME' should not be null")
+        val filename: String? = inputData.getString(ARG_FILE_NAME)
         val savedDir: String = inputData.getString(ARG_SAVED_DIR)
             ?: throw IllegalArgumentException("Argument '$ARG_SAVED_DIR' should not be null")
         val headers: String = inputData.getString(ARG_HEADERS)
             ?: throw IllegalArgumentException("Argument '$ARG_HEADERS' should not be null")
-        var isResume: Boolean = inputData.getBoolean(ARG_IS_RESUME, false)
+        val isResume: Boolean = inputData.getBoolean(ARG_IS_RESUME, false)
         val timeout: Int = inputData.getInt(ARG_TIMEOUT, 15000)
         debug = inputData.getBoolean(ARG_DEBUG, false)
         step = inputData.getInt(ARG_STEP, 10)
         ignoreSsl = inputData.getBoolean(ARG_IGNORESSL, false)
+
+        // Grab all of our localized strings from resources
         val res = applicationContext.resources
         msgStarted = res.getString(R.string.flutter_downloader_notification_started)
         msgInProgress = res.getString(R.string.flutter_downloader_notification_in_progress)
@@ -213,25 +257,33 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         msgFailed = res.getString(R.string.flutter_downloader_notification_failed)
         msgPaused = res.getString(R.string.flutter_downloader_notification_paused)
         msgComplete = res.getString(R.string.flutter_downloader_notification_complete)
+
         downloadStartTime = System.currentTimeMillis()
         lastUpdateTime = downloadStartTime
+
         val task = taskDao?.loadTask(id.toString())
         log(
-            "DownloadWorker{url=$url,filename=$filename,savedDir=$savedDir,header=$headers,isResume=$isResume,status=" + (
-                    task?.status
-                        ?: "GONE"
-                    )
+            "DownloadWorker{url=$url,filename=$filename,savedDir=$savedDir,header=$headers,isResume=$isResume,status="
+                    + (task?.status ?: "GONE") +
+                    "}"
         )
 
+        // If the task is already canceled (or missing), we bail immediately
         if (task == null || task.status == DownloadStatus.CANCELED) {
             return Result.success()
         }
+
+        // Read the boolean flags we passed in
         showNotification = inputData.getBoolean(ARG_SHOW_NOTIFICATION, false)
         clickToOpenDownloadedFile =
             inputData.getBoolean(ARG_OPEN_FILE_FROM_NOTIFICATION, false)
         saveInPublicStorage = inputData.getBoolean(ARG_SAVE_IN_PUBLIC_STORAGE, false)
         primaryId = task.primaryId
+
+        // Show (or create) our notification channel if needed
         setupNotification(applicationContext)
+
+        // Update the SQLite entry to “RUNNING” and show a “Starting download…” notification
         updateNotification(
             applicationContext,
             filename ?: "Starting Download...",
@@ -240,29 +292,35 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             null,
             false
         )
-        val dao = taskDao
-        if (dao != null) {
-            dao.updateTask(id.toString(), DownloadStatus.RUNNING, task.progress)
-        }
+        taskDao?.updateTask(id.toString(), DownloadStatus.RUNNING, task.progress)
 
+        // If a partial file already exists, mark it resumable in the database
         val saveFilePath = savedDir + File.separator + filename
         val partialFile = File(saveFilePath)
         if (partialFile.exists()) {
-            // mark task as resumable
             taskDao?.updateTaskResumable(id.toString(), true)
-            log("exists file for " + filename + "automatic resuming...")
+            log("Partial file exists for $filename; automatic resume next time.")
         }
 
-        // --- ADDED: Reset pause flag on start ---
+        // Reset pause flag when we start
         isPaused = false
 
         return try {
-            downloadFile(applicationContext, url, savedDir, filename, headers, isResume, timeout)
+            downloadFile(
+                applicationContext,
+                url,
+                savedDir,
+                filename,
+                headers,
+                isResume,
+                timeout
+            )
             cleanUp()
             dbHelper = null
             taskDao = null
             Result.success()
         } catch (e: Exception) {
+            // On any error, mark it FAILED and notify both SQLite + notification
             updateNotification(
                 applicationContext,
                 filename ?: "Download failed",
@@ -279,23 +337,31 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         }
     }
 
+    /**
+     * Helper to set any custom HTTP headers on our HttpURLConnection.
+     */
     private fun setupHeaders(conn: HttpURLConnection, headers: String) {
         if (headers.isNotEmpty()) {
             log("Headers = $headers")
             try {
                 val json = JSONObject(headers)
-                val it: Iterator<String> = json.keys()
+                val it = json.keys() // Kotlin will infer java.util.Iterator<String>
                 while (it.hasNext()) {
                     val key = it.next()
                     conn.setRequestProperty(key, json.getString(key))
                 }
                 conn.doInput = true
-            } catch (e: JSONException) {
+            } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
     }
 
+    /**
+     * If isResume==true, add an HTTP “Range: bytes=${downloaded}-” header to pick up
+     * from where we left off.
+     * Returns how many bytes were already on disk.
+     */
     private fun setupPartialDownloadedDataHeader(
         conn: HttpURLConnection,
         filename: String?,
@@ -304,295 +370,401 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         val saveFilePath = savedDir + File.separator + filename
         val partialFile = File(saveFilePath)
         val downloadedBytes: Long = partialFile.length()
-        log("Resume download: Range: bytes=$downloadedBytes-")
+        log("Resuming download: Range: bytes=$downloadedBytes-")
         conn.setRequestProperty("Accept-Encoding", "identity")
         conn.setRequestProperty("Range", "bytes=$downloadedBytes-")
         conn.doInput = true
         return downloadedBytes
     }
 
-    private fun downloadFile(
-        context: Context,
-        fileURL: String,
-        savedDir: String,
-        filename: String?,
-        headers: String,
-        isResume: Boolean,
-        timeout: Int
-    ) {
-        var actualFilename = filename
-        var url = fileURL
-        var resourceUrl: URL
-        var base: URL?
-        var next: URL
-        val visited: MutableMap<String, Int> = HashMap()
-        var httpConn: HttpURLConnection? = null
-        var inputStream: InputStream? = null
-        var outputStream: OutputStream? = null
-        var location: String
-        var downloadedBytes: Long = 0
-        var responseCode: Int
-        var times: Int
+    /**
+     * The “meat” of the worker: open an HttpURLConnection, follow redirects up to 3×,
+     * stream bytes into either a brand‐new file (when isResume=false) or append to an
+     * existing partial file (when isResume=true).  On every “step”, do three things:
+     *  1) write to the OutputStream
+     *  2) update the SQLite row’s progress
+     *  3) call updateNotification(...) to refresh the notification
+     *  4) call sendUpdateProcessEvent(...) to send progress back to Dart
+     */
+   private fun downloadFile(
+    context: Context,
+    fileURL: String,
+    savedDir: String,
+    filename: String?,
+    headers: String,
+    isResume: Boolean,
+    timeout: Int
+) {
+    var actualFilename = filename
+    var url = fileURL
+    var resourceUrl: URL
+    var base: URL?
+    var next: URL
+    val visited: MutableMap<String, Int> = HashMap()
+    var httpConn: HttpURLConnection? = null
+    var inputStream: InputStream? = null
+    var outputStream: OutputStream? = null
+    var downloadedBytes: Long = 0
+    var responseCode: Int
+    var times: Int
 
-        try {
-            val task = taskDao?.loadTask(id.toString())
-            if (task != null) {
-                lastProgress = task.progress
+    try {
+        val task = taskDao?.loadTask(id.toString())
+        if (task != null) {
+            lastProgress = task.progress
+        }
+
+        // 1) Follow redirects (up to 3×) and open the connection
+        while (true) {
+            if (!visited.containsKey(url)) {
+                times = 1
+                visited[url] = times
+            } else {
+                times = visited[url]!! + 1
+                visited[url] = times
             }
+            if (times > 3) throw IOException("Stuck in redirect loop")
 
-            // 1) Handle redirects and open connection
-            while (true) {
-                if (!visited.containsKey(url)) {
-                    times = 1
-                    visited[url] = times
-                } else {
-                    times = visited[url]!! + 1
-                    visited[url] = times
-                }
-                if (times > 3) throw IOException("Stuck in redirect loop")
-
-                resourceUrl = URL(url)
-                httpConn = if (ignoreSsl) {
-                    trustAllHosts()
-                    if (resourceUrl.protocol.lowercase(Locale.US) == "https") {
-                        val https: HttpsURLConnection =
-                            resourceUrl.openConnection() as HttpsURLConnection
-                        https.hostnameVerifier = DO_NOT_VERIFY
-                        https
-                    } else {
-                        resourceUrl.openConnection() as HttpURLConnection
-                    }
-                } else {
-                    if (resourceUrl.protocol.lowercase(Locale.US) == "https") {
+            resourceUrl = URL(url)
+            httpConn = if (ignoreSsl) {
+                trustAllHosts()
+                if (resourceUrl.protocol.lowercase(Locale.US) == "https") {
+                    val https: HttpsURLConnection =
                         resourceUrl.openConnection() as HttpsURLConnection
-                    } else {
-                        resourceUrl.openConnection() as HttpURLConnection
-                    }
+                    https.hostnameVerifier = DO_NOT_VERIFY
+                    https
+                } else {
+                    resourceUrl.openConnection() as HttpURLConnection
                 }
-
-                log("Open connection to $url")
-                httpConn.connectTimeout = timeout
-                httpConn.readTimeout = timeout
-                httpConn.instanceFollowRedirects = false
-                httpConn.setRequestProperty("User-Agent", "Mozilla/5.0...")
-
-                setupHeaders(httpConn, headers)
-
-                if (isResume) {
-                    downloadedBytes =
-                        setupPartialDownloadedDataHeader(httpConn, actualFilename, savedDir)
+            } else {
+                if (resourceUrl.protocol.lowercase(Locale.US) == "https") {
+                    resourceUrl.openConnection() as HttpsURLConnection
+                } else {
+                    resourceUrl.openConnection() as HttpURLConnection
                 }
-
-                responseCode = httpConn.responseCode
-
-                when (responseCode) {
-                    HttpURLConnection.HTTP_MOVED_PERM,
-                    HttpURLConnection.HTTP_SEE_OTHER,
-                    HttpURLConnection.HTTP_MOVED_TEMP,
-                    307,
-                    308 -> {
-                        log("Response with redirection code")
-                        location = httpConn.getHeaderField("Location")
-                        log("Location = $location")
-                        base = URL(url)
-                        next = URL(base, location)
-                        url = next.toExternalForm()
-                        log("New url: $url")
-                        continue
-                    }
-                }
-                break
             }
 
-            httpConn!!.connect()
+            log("Opening connection to $url")
+            httpConn!!.connectTimeout = timeout
+            httpConn.readTimeout = timeout
+            httpConn.instanceFollowRedirects = false
+            httpConn.setRequestProperty("User-Agent", "Mozilla/5.0...")
 
-            if ((responseCode == HttpURLConnection.HTTP_OK || (isResume && responseCode == HttpURLConnection.HTTP_PARTIAL)) && !isStopped) {
-                val contentType: String? = httpConn.contentType
-                val contentLength: Long = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N)
-                    httpConn.contentLengthLong
-                else
-                    httpConn.contentLength.toLong()
+            // Apply any custom headers
+            setupHeaders(httpConn, headers)
 
-                if (contentType != null) {
-                    log("Content-Type = $contentType")
+            // If this is a resume, add the “Range:” header
+            if (isResume) {
+                downloadedBytes =
+                    setupPartialDownloadedDataHeader(httpConn, actualFilename, savedDir)
+            }
+
+            responseCode = httpConn.responseCode
+            when (responseCode) {
+                HttpURLConnection.HTTP_MOVED_PERM,
+                HttpURLConnection.HTTP_SEE_OTHER,
+                HttpURLConnection.HTTP_MOVED_TEMP,
+                307,
+                308 -> {
+                    log("Redirect response ($responseCode)")
+                    val location = httpConn.getHeaderField("Location")
+                    log("→ Location = $location")
+                    base = URL(url)
+                    next = URL(base, location)
+                    url = next.toExternalForm()
+                    log("→ New URL: $url")
+                    continue
                 }
-                log("Content-Length = $contentLength")
+            }
+            break
+        }
 
-                val charset = getCharsetFromContentType(contentType)
-                log("Charset = $charset")
+        // Now that we’ve built the connection (with or without a Range header), connect:
+        httpConn!!.connect()
 
-                if (!isResume) {
-                    if (actualFilename == null) {
-                        val disposition: String? = httpConn.getHeaderField("Content-Disposition")
-                        log("Content-Disposition = $disposition")
-                        if (!disposition.isNullOrEmpty()) {
-                            actualFilename = getFileNameFromContentDisposition(disposition, charset)
+        // ────────────────────────────────────────────────────────────────────────────────
+        // If the server returns “416 Requested Range Not Satisfiable,” it means
+        // our partial file is already ≥ full length.  Treat that as “complete.”
+        if (isResume &&
+            responseCode == 416  // HTTP 416 = Requested Range Not Satisfiable
+        ) {
+            log("Server responded 416 (Range Not Satisfiable); marking task as COMPLETE.")
+            taskDao?.updateTask(id.toString(), DownloadStatus.COMPLETE, 100.0)
+            updateNotification(
+                context,
+                actualFilename,
+                DownloadStatus.COMPLETE,
+                100.0,
+                null,
+                true
+            )
+            sendUpdateProcessEvent(DownloadStatus.COMPLETE, 100.0)
+            return
+        }
+        // ────────────────────────────────────────────────────────────────────────────────
+
+        // If server gives us 200 (OK) or 206 (Partial) and we haven’t been stopped:
+        if ((responseCode == HttpURLConnection.HTTP_OK
+                    || (isResume && responseCode == HttpURLConnection.HTTP_PARTIAL))
+            && !isStopped
+        ) {
+            val contentType: String? = httpConn.contentType
+            val contentLength: Long = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N)
+                httpConn.contentLengthLong
+            else
+                httpConn.contentLength.toLong()
+
+            if (contentType != null) {
+                log("Content-Type = $contentType")
+            }
+            log("Content-Length = $contentLength")
+
+            val charset = getCharsetFromContentType(contentType)
+            log("Charset = $charset")
+
+            // If we’re not resuming, derive the filename from headers or URL:
+            if (!isResume) {
+                if (actualFilename == null) {
+                    val disposition: String? = httpConn.getHeaderField("Content-Disposition")
+                    log("Content-Disposition = $disposition")
+                    if (!disposition.isNullOrEmpty()) {
+                        actualFilename =
+                            getFileNameFromContentDisposition(disposition, charset)
+                    }
+                    if (actualFilename.isNullOrEmpty()) {
+                        actualFilename = url.substring(url.lastIndexOf("/") + 1)
+                        try {
+                            actualFilename = URLDecoder.decode(actualFilename, "UTF-8")
+                        } catch (e: IllegalArgumentException) {
+                            e.printStackTrace()
                         }
-                        if (actualFilename.isNullOrEmpty()) {
-                            actualFilename = url.substring(url.lastIndexOf("/") + 1)
-                            try {
-                                actualFilename = URLDecoder.decode(actualFilename, "UTF-8")
-                            } catch (e: IllegalArgumentException) {
-                                e.printStackTrace()
-                            }
-                        }
                     }
                 }
+            }
 
-                log("fileName = $actualFilename")
-                taskDao?.updateTask(id.toString(), actualFilename, contentType)
+            log("Resolved filename = $actualFilename")
+            taskDao?.updateTask(id.toString(), actualFilename, contentType)
 
-                inputStream = httpConn.inputStream
+            inputStream = httpConn.inputStream
 
-                val savedFilePath: String?
-                if (isResume) {
-                    savedFilePath = savedDir + File.separator + actualFilename
-                    outputStream = FileOutputStream(savedFilePath, true)
-                } else {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
-                        val uri = createFileInPublicDownloadsDir(actualFilename, contentType)
-                        savedFilePath = getMediaStoreEntryPathApi29(uri!!)
-                        outputStream = context.contentResolver.openOutputStream(uri, "w")
-                    } else {
-                        val file = createFileInAppSpecificDir(actualFilename!!, savedDir)
-                        savedFilePath = file!!.path
-                        outputStream = FileOutputStream(file, false)
-                    }
+            // ─────────────────────────────────────────────────────────────────────────────
+// Instead of always doing FileOutputStream(..., true) on resume, do this:
+//
+//  • On Q+ and saveInPublicStorage==true → find the MediaStore.Downloads URI and open with "wa" (append)
+//  • Otherwise → fall back to a normal FileOutputStream(..., true)
+// ─────────────────────────────────────────────────────────────────────────────
+
+var savedFilePath: String? = null
+var outputStream: OutputStream? = null
+
+if (isResume) {
+  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
+    // Try to find the existing Downloads URI for this filename
+    val downloadUri = findExistingDownloadUri(actualFilename ?: "")
+    if (downloadUri != null) {
+      // Append into that same MediaStore row
+      outputStream = applicationContext.contentResolver.openOutputStream(downloadUri, "wa")
+      savedFilePath = getMediaStoreEntryPathApi29(downloadUri)
+    } else {
+      // Fallback → create a fresh MediaStore entry and append to it
+      val newUri = createFileInPublicDownloadsDir(actualFilename, contentType)
+      outputStream = applicationContext.contentResolver.openOutputStream(newUri!!, "wa")
+      savedFilePath = getMediaStoreEntryPathApi29(newUri)
+    }
+  } else {
+    // Normal “append into app‐specific dir” (no special permissions needed)
+    val savedFile = File(savedDir, actualFilename ?: "")
+    outputStream = FileOutputStream(savedFile, true)
+    savedFilePath = savedFile.path
+  }
+} else {
+  // ── Brand-new download (overwriting or creating from scratch) ──
+  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
+    val uri = createFileInPublicDownloadsDir(actualFilename, contentType)
+    savedFilePath = getMediaStoreEntryPathApi29(uri!!)
+    val parentDir = File(savedFilePath!!).parent ?: savedDir
+    taskDao?.updateTaskSavedDir(id.toString(), parentDir)
+    outputStream = applicationContext.contentResolver.openOutputStream(uri, "w")
+  } else {
+    val file = createFileInAppSpecificDir(actualFilename!!, savedDir)
+    savedFilePath = file!!.path
+    outputStream = FileOutputStream(file, false)
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// … now proceed with “while (inputStream.read(buffer) != -1) { … outputStream.write(…) … }” etc.
+
+
+
+
+            var count = downloadedBytes
+            var bytesRead: Int
+            val buffer = ByteArray(BUFFER_SIZE)
+
+            while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                if (isStopped) {
+                    log("Download stopped (paused or canceled)")
+                    break
                 }
+                count += bytesRead.toLong()
+                val progress =
+                    (count * 100.0 / (contentLength + downloadedBytes)).coerceAtMost(100.0)
+                outputStream?.write(buffer, 0, bytesRead)
 
-                var count = downloadedBytes
-                var bytesRead: Int
-                val buffer = ByteArray(BUFFER_SIZE)
+                if ((lastProgress == 0.0 || progress > lastProgress + step || progress == 100.0)
+                    && progress != lastProgress
+                ) {
+                    lastProgress = progress
+                    downloadedBytesSoFar = count
+                    val currentTime = System.currentTimeMillis()
+                    val timeElapsed = currentTime - downloadStartTime
+                    val speedBytesPerSec =
+                        if (timeElapsed > 0) (downloadedBytesSoFar * 1000 / timeElapsed) else 0
+                    val remainingBytes = (contentLength + downloadedBytes) - downloadedBytesSoFar
+                    val estimatedRemainingTimeSec =
+                        if (speedBytesPerSec > 0) (remainingBytes / speedBytesPerSec) else -1
 
-                // 2) Main download loop with stop/pause support
-                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                    if (isStopped) {
-                        log("Download stopped (paused or canceled)")
-                        break
-                    }
-                    count += bytesRead.toLong()
-                    val progress = (count * 100.0 / (contentLength + downloadedBytes)).coerceAtMost(100.0)
-                    outputStream?.write(buffer, 0, bytesRead)
-
-                    if ((lastProgress == 0.0 || progress > lastProgress + step || progress == 100.0) &&
-                        progress != lastProgress
-                    ) {
-                        lastProgress = progress
-                        downloadedBytesSoFar = count
-                        val currentTime = System.currentTimeMillis()
-                        val timeElapsed = currentTime - downloadStartTime // ms
-                        val speedBytesPerSec = if (timeElapsed > 0) (downloadedBytesSoFar * 1000 / timeElapsed) else 0
-                        val remainingBytes = (contentLength + downloadedBytes) - downloadedBytesSoFar
-                        val estimatedRemainingTimeSec = if (speedBytesPerSec > 0) (remainingBytes / speedBytesPerSec) else -1
-
-                        val speedText = if (speedBytesPerSec > 0) {
-                            val speedKB = speedBytesPerSec / 1024.0
-                            if (speedKB >= 1024) {
-                                val speedMB = speedKB / 1024.0
-                                String.format(Locale.US, "%.2f MB/s", speedMB)
-                            } else {
-                                String.format(Locale.US, "%.0f KB/s", speedKB)
-                            }
+                    val speedText = if (speedBytesPerSec > 0) {
+                        val speedKB = speedBytesPerSec / 1024.0
+                        if (speedKB >= 1024) {
+                            val speedMB = speedKB / 1024.0
+                            String.format(Locale.US, "%.2f MB/s", speedMB)
                         } else {
-                            "Calculating..."
+                            String.format(Locale.US, "%.0f KB/s", speedKB)
                         }
+                    } else {
+                        "Calculating..."
+                    }
 
-                        val timeText = if (estimatedRemainingTimeSec >= 0)
+                    val timeText =
+                        if (estimatedRemainingTimeSec >= 0)
                             formatRemainingTime(estimatedRemainingTimeSec)
                         else
                             "Unknown time left"
 
-                        val progressText = "$speedText · $timeText"
+                    val progressText = "$speedText · $timeText"
 
-                        taskDao!!.updateTask(id.toString(), DownloadStatus.RUNNING, progress)
-                        updateNotification(
-                            context,
+                    taskDao!!.updateTask(id.toString(), DownloadStatus.RUNNING, progress)
+                    updateNotification(
+                        context,
+                        actualFilename,
+                        DownloadStatus.RUNNING,
+                        progress,
+                        null,
+                        false,
+                        progressText
+                    )
+                    sendUpdateProcessEvent(DownloadStatus.RUNNING, progress)
+                }
+            }
+
+            // Determine final status + progress
+            val loadedTask = taskDao?.loadTask(id.toString())
+            val progress = if (isStopped && loadedTask!!.resumable) lastProgress else 100.0
+            val status = if (isStopped)
+                if (loadedTask!!.resumable) DownloadStatus.PAUSED else DownloadStatus.CANCELED
+            else
+                DownloadStatus.COMPLETE
+
+            val storage: Int = ContextCompat.checkSelfPermission(
+                applicationContext,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            )
+            var pendingIntent: PendingIntent? = null
+            if (status == DownloadStatus.COMPLETE) {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                    if (isImageOrVideoFile(contentType) && isExternalStoragePath(savedFilePath)) {
+                        addImageOrVideoToGallery(
                             actualFilename,
-                            DownloadStatus.RUNNING,
-                            progress,
-                            null,
-                            false,
-                            progressText
+                            savedFilePath,
+                            getContentTypeWithoutCharset(contentType)
                         )
                     }
                 }
-
-                val loadedTask = taskDao?.loadTask(id.toString())
-                val progress = if (isStopped && loadedTask!!.resumable) lastProgress else 100.0
-                val status = if (isStopped)
-                    if (loadedTask!!.resumable) DownloadStatus.PAUSED else DownloadStatus.CANCELED
-                else
-                    DownloadStatus.COMPLETE
-
-                val storage: Int = ContextCompat.checkSelfPermission(
-                    applicationContext,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE
-                )
-                var pendingIntent: PendingIntent? = null
-                if (status == DownloadStatus.COMPLETE) {
-                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-                        if (isImageOrVideoFile(contentType) && isExternalStoragePath(savedFilePath)) {
-                            addImageOrVideoToGallery(
-                                actualFilename,
-                                savedFilePath,
-                                getContentTypeWithoutCharset(contentType)
-                            )
-                        }
-                    }
-                    if (clickToOpenDownloadedFile) {
-                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && storage != PackageManager.PERMISSION_GRANTED) return
-                        val intent = IntentUtils.validatedFileIntent(
-                            applicationContext,
-                            savedFilePath!!,
-                            contentType
-                        )
-                        if (intent != null) {
-                            log("Setting an intent to open the file $savedFilePath")
-                            val flags: Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                if (clickToOpenDownloadedFile) {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+                        storage != PackageManager.PERMISSION_GRANTED
+                    ) return
+                    val intent = IntentUtils.validatedFileIntent(
+                        applicationContext,
+                        savedFilePath!!,
+                        contentType
+                    )
+                    if (intent != null) {
+                        log("Setting intent to open file: $savedFilePath")
+                        val flags: Int =
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
                                 PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
                             else
                                 PendingIntent.FLAG_CANCEL_CURRENT
-                            pendingIntent =
-                                PendingIntent.getActivity(applicationContext, 0, intent, flags)
-                        } else {
-                            log("There's no application that can open the file $savedFilePath")
-                        }
+                        pendingIntent = PendingIntent.getActivity(
+                            applicationContext,
+                            0,
+                            intent,
+                            flags
+                        )
+                    } else {
+                        log("No app can open $savedFilePath")
                     }
                 }
-
-                taskDao!!.updateTask(id.toString(), status, progress)
-                updateNotification(context, actualFilename, status, progress, pendingIntent, true)
-                log(if (isStopped) "Download canceled or paused" else "File downloaded")
-            } else {
-                val loadedTask = taskDao!!.loadTask(id.toString())
-                val status = if (isStopped)
-                    if (loadedTask!!.resumable) DownloadStatus.PAUSED else DownloadStatus.CANCELED
-                else
-                    DownloadStatus.FAILED
-
-                taskDao!!.updateTask(id.toString(), status, lastProgress)
-                updateNotification(context, actualFilename ?: fileURL, status, -1.0, null, true)
-                log(if (isStopped) "Download canceled or paused" else "Server replied HTTP code: $responseCode")
             }
-        } catch (e: IOException) {
-            taskDao!!.updateTask(id.toString(), DownloadStatus.FAILED, lastProgress)
+
+            taskDao!!.updateTask(id.toString(), status, progress)
             updateNotification(
                 context,
-                actualFilename ?: "Download failed",
-                DownloadStatus.FAILED,
+                actualFilename,
+                status,
+                progress,
+                pendingIntent,
+                true
+            )
+            log(if (isStopped) "Download canceled/paused" else "Download complete")
+        } else {
+            // Canceled or “unexpected” response code
+            val loadedTask = taskDao!!.loadTask(id.toString())
+            val status = if (isStopped)
+                if (loadedTask!!.resumable) DownloadStatus.PAUSED else DownloadStatus.CANCELED
+            else
+                DownloadStatus.FAILED
+
+            taskDao!!.updateTask(id.toString(), status, lastProgress)
+            updateNotification(
+                context,
+                filename ?: fileURL,
+                status,
                 -1.0,
                 null,
                 true
             )
-            e.printStackTrace()
-        } finally {
-            outputStream?.flush()
-            outputStream?.close()
-            inputStream?.close()
-            httpConn?.disconnect()
+            log(
+                if (isStopped) "Download canceled/paused"
+                else "HTTP $responseCode, marked FAILED"
+            )
         }
+    } catch (e: IOException) {
+        taskDao!!.updateTask(id.toString(), DownloadStatus.FAILED, lastProgress)
+        updateNotification(
+            context,
+            filename ?: "Download failed",
+            DownloadStatus.FAILED,
+            -1.0,
+            null,
+            true
+        )
+        e.printStackTrace()
+    } finally {
+        outputStream?.flush()
+        outputStream?.close()
+        inputStream?.close()
+        httpConn?.disconnect()
     }
+}
 
+
+    /**
+     * Format remaining seconds into “Xm Ys left” or “Zs left.”
+     */
     private fun formatRemainingTime(seconds: Long): String {
         val minutes = seconds / 60
         val secs = seconds % 60
@@ -604,7 +776,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
     }
 
     /**
-     * Create a file using java.io API
+     * Create a brand‐new file under “savedDir/filename” (java.io API).
      */
     private fun createFileInAppSpecificDir(filename: String, savedDir: String): File? {
         val newFile = File(savedDir, filename)
@@ -613,65 +785,135 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             if (rs) {
                 return newFile
             } else {
-                logError("It looks like you are trying to save file in public storage but not setting 'saveInPublicStorage' to 'true'")
+                logError("Could not create file in app‐specific dir")
             }
         } catch (e: IOException) {
             e.printStackTrace()
-            logError("Create a file using java.io API failed ")
+            logError("createFileInAppSpecificDir failed: ${e.message}")
         }
         return null
     }
 
     /**
-     * Create a file inside the Download folder using MediaStore API
+     * For Android Q+ with “saveInPublicStorage = true,” we insert a row into MediaStore.Downloads
+     * so the file ends up in the public Download folder.  This returns a URI we can open an
+     * OutputStream on.
      */
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun createFileInPublicDownloadsDir(filename: String?, mimeType: String?): Uri? {
         val collection: Uri = MediaStore.Downloads.EXTERNAL_CONTENT_URI
-        val values = ContentValues()
-        values.put(MediaStore.Downloads.DISPLAY_NAME, filename)
-        values.put(MediaStore.Downloads.MIME_TYPE, mimeType)
-        values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, filename)
+            put(MediaStore.Downloads.MIME_TYPE, mimeType)
+            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+        }
         val contentResolver = applicationContext.contentResolver
-        try {
-            return contentResolver.insert(collection, values)
+        return try {
+            contentResolver.insert(collection, values)
         } catch (e: Exception) {
             e.printStackTrace()
-            logError("Create a file using MediaStore API failed.")
+            logError("createFileInPublicDownloadsDir failed: ${e.message}")
+            null
         }
-        return null
     }
 
+      /**
+   * Look up the MediaStore.Downloads URI for an existing file named `fileName`.
+   * Returns null if no matching row is found.
+   */
+  @RequiresApi(Build.VERSION_CODES.Q)
+private fun findExistingDownloadUri(fileName: String): Uri? {
+  val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+  val projection = arrayOf(MediaStore.Downloads._ID)
+  val selection = "${MediaStore.Downloads.DISPLAY_NAME} = ?"
+  val selectionArgs = arrayOf(fileName)
+
+  applicationContext.contentResolver
+    .query(collection, projection, selection, selectionArgs, null)
+    ?.use { cursor ->
+      if (cursor.moveToFirst()) {
+        val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Downloads._ID))
+        return ContentUris.withAppendedId(collection, id)
+      }
+    }
+  return null
+}
+
     /**
-     * Get a path for a MediaStore entry as it's needed when calling MediaScanner
+     * Once the file is fully written on disk, Android Q+ requires us to fetch the actual “DATA” path
+     * via a query on MediaStore so we can pass a real file path to any gallery/scanner logic.
      */
     private fun getMediaStoreEntryPathApi29(uri: Uri): String? {
-        try {
+        return try {
             applicationContext.contentResolver.query(
                 uri,
                 arrayOf(MediaStore.Files.FileColumns.DATA),
                 null,
                 null,
                 null
-            ).use { cursor ->
-                if (cursor == null) return null
-                return if (!cursor.moveToFirst()) {
-                    null
-                } else {
-                    cursor.getString(
-                        cursor.getColumnIndexOrThrow(
-                            MediaStore.Files.FileColumns.DATA
-                        )
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) return null
+                cursor.getString(
+                    cursor.getColumnIndexOrThrow(
+                        MediaStore.Files.FileColumns.DATA
                     )
-                }
+                )
             }
         } catch (e: IllegalArgumentException) {
             e.printStackTrace()
-            logError("Get a path for a MediaStore failed")
-            return null
+            logError("getMediaStoreEntryPathApi29 failed: ${e.message}")
+            null
         }
     }
 
+    /**
+     * If the final status is COMPLETE (and the file is an image or video,
+     * and it lives on external storage), we insert a row into the image/video
+     * collection so it appears in the user’s gallery.
+     */
+    private fun addImageOrVideoToGallery(
+        fileName: String?,
+        filePath: String?,
+        contentType: String?
+    ) {
+        if (contentType != null && filePath != null && fileName != null) {
+            if (contentType.startsWith("image/")) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Images.Media.TITLE, fileName)
+                    put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                    put(MediaStore.Images.Media.DESCRIPTION, "")
+                    put(MediaStore.Images.Media.MIME_TYPE, contentType)
+                    put(MediaStore.Images.Media.DATE_ADDED, System.currentTimeMillis())
+                    put(MediaStore.Images.Media.DATE_TAKEN, System.currentTimeMillis())
+                    put(MediaStore.Images.Media.DATA, filePath)
+                }
+                Log.d(TAG, "Inserting $fileName into image gallery")
+                applicationContext.contentResolver.insert(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    values
+                )
+            } else if (contentType.startsWith("video")) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.TITLE, fileName)
+                    put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
+                    put(MediaStore.Video.Media.DESCRIPTION, "")
+                    put(MediaStore.Video.Media.MIME_TYPE, contentType)
+                    put(MediaStore.Video.Media.DATE_ADDED, System.currentTimeMillis())
+                    put(MediaStore.Video.Media.DATE_TAKEN, System.currentTimeMillis())
+                    put(MediaStore.Video.Media.DATA, filePath)
+                }
+                Log.d(TAG, "Inserting $fileName into video gallery")
+                applicationContext.contentResolver.insert(
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                    values
+                )
+            }
+        }
+    }
+
+    /**
+     * Remove any partial file if the final status is not COMPLETE and “resumable=false”.
+     */
     private fun cleanUp() {
         val task = taskDao?.loadTask(id.toString()) ?: return
         if (task.status != DownloadStatus.COMPLETE && !task.resumable) {
@@ -679,35 +921,40 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             if (filename == null) {
                 filename = task.url.substring(task.url.lastIndexOf("/") + 1)
             }
-
             val saveFilePath = task.savedDir + File.separator + filename
             val tempFile = File(saveFilePath)
             if (tempFile.exists()) {
                 val deleted = tempFile.delete()
-                log("Deleted temp file: $saveFilePath = $deleted")
+                log("Deleted temp file: $saveFilePath → $deleted")
             }
         }
     }
 
+    /**
+     * Fetch our notification icon from AndroidManifest metadata or fallback
+     */
     private val notificationIconRes: Int
         get() {
-            try {
-                val applicationInfo: ApplicationInfo = applicationContext.packageManager
-                    .getApplicationInfo(
+            return try {
+                val applicationInfo: ApplicationInfo =
+                    applicationContext.packageManager.getApplicationInfo(
                         applicationContext.packageName,
                         PackageManager.GET_META_DATA
                     )
                 val appIconResId: Int = applicationInfo.icon
-                return applicationInfo.metaData.getInt(
+                applicationInfo.metaData.getInt(
                     "vn.hunghd.flutterdownloader.NOTIFICATION_ICON",
                     appIconResId
                 )
             } catch (e: PackageManager.NameNotFoundException) {
                 e.printStackTrace()
+                0
             }
-            return 0
         }
 
+    /**
+     * Create (or no-op if already created) the notification channel on Android O+.
+     */
     private fun setupNotification(context: Context) {
         if (!showNotification) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -717,17 +964,18 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             val channelDescription: String =
                 res.getString(R.string.flutter_downloader_notification_channel_description)
             val importance: Int = NotificationManager.IMPORTANCE_LOW
-            val channel = NotificationChannel(CHANNEL_ID, channelName, importance)
-            channel.description = channelDescription
-            channel.setSound(null, null)
-
-            val notificationManager: NotificationManagerCompat =
-                NotificationManagerCompat.from(context)
-            notificationManager.createNotificationChannel(channel)
+            val channel = NotificationChannel(CHANNEL_ID, channelName, importance).apply {
+                description = channelDescription
+                setSound(null, null)
+            }
+            NotificationManagerCompat.from(context).createNotificationChannel(channel)
         }
     }
 
-    // --- MODIFIED: updateNotification with Pause, Resume, Cancel buttons ---
+    /**
+     * Build or update the ongoing notification with Pause/Resume/Cancel buttons.
+     * If “finalize=true,” we allow it to be auto-cancelled (for COMPLETE/FAILED/CANCELED).
+     */
     private fun updateNotification(
         context: Context,
         title: String?,
@@ -737,6 +985,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         finalize: Boolean,
         progressText: String? = null
     ) {
+        // Always send status/progress back to Dart before updating the notification UI:
         sendUpdateProcessEvent(status, progress)
 
         if (!showNotification) return
@@ -747,9 +996,12 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
 
-        // --- ADDED: Prepare PendingIntents for notification buttons ---
+        // Prepare “Pause,” “Resume,” “Cancel” PendingIntents:
         val pauseIntent = Intent(ACTION_PAUSE).apply { setPackage(context.packageName) }
-        val resumeIntent = Intent(ACTION_RESUME).apply { setPackage(context.packageName) }
+        val resumeIntent = Intent(ACTION_RESUME).apply {
+    setPackage(context.packageName)
+    putExtra("TASK_ID", id.toString())
+}
         val cancelIntent = Intent(ACTION_CANCEL).apply { setPackage(context.packageName) }
 
         val pausePendingIntent = PendingIntent.getBroadcast(
@@ -757,9 +1009,11 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val resumePendingIntent = PendingIntent.getBroadcast(
-            context, 2, resumeIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+    context,
+    2,
+    resumeIntent,
+    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+)
         val cancelPendingIntent = PendingIntent.getBroadcast(
             context, 3, cancelIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
@@ -772,88 +1026,122 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 if (progress <= 0) {
                     builder.setContentText(msgStarted)
                         .setProgress(0, 0, false)
-                    builder.setOngoing(true).setAutoCancel(false)
+                        .setOngoing(true)
+                        .setAutoCancel(false)
                         .setSmallIcon(notificationIconRes)
                 } else if (progress < 100) {
-                    val finalProgressText = if (progressText != null)
-                        "$msgInProgress - $progressPercentage - $progressText"
-                    else
-                        "$msgInProgress - $progressPercentage"
+                    val finalProgressText =
+                        if (progressText != null)
+                            "$msgInProgress – $progressPercentage – $progressText"
+                        else
+                            "$msgInProgress – $progressPercentage"
+
                     builder.setContentText(finalProgressText)
                         .setProgress(100, progress.toInt(), false)
-                    builder.setOngoing(true).setAutoCancel(false)
+                        .setOngoing(true)
+                        .setAutoCancel(false)
                         .setSmallIcon(android.R.drawable.stat_sys_download)
-                    builder.addAction(
-                        android.R.drawable.ic_media_pause,
-                        "Pause",
-                        pausePendingIntent
-                    )
-                    builder.addAction(
-                        android.R.drawable.ic_menu_close_clear_cancel,
-                        "Cancel",
-                        cancelPendingIntent
-                    )
+                        .addAction(
+                            android.R.drawable.ic_media_pause,
+                            "Pause",
+                            pausePendingIntent
+                        )
+                        .addAction(
+                            android.R.drawable.ic_menu_close_clear_cancel,
+                            "Cancel",
+                            cancelPendingIntent
+                        )
                 } else {
-                    builder.setContentText(msgComplete).setProgress(0, 0, false)
-                    builder.setOngoing(false).setAutoCancel(true)
+                    builder.setContentText(msgComplete)
+                        .setProgress(0, 0, false)
+                        .setOngoing(false)
+                        .setAutoCancel(true)
                         .setSmallIcon(android.R.drawable.stat_sys_download_done)
                 }
             }
 
             DownloadStatus.PAUSED -> {
-                builder.setContentText("$msgPaused - $progressPercentage").setProgress(0, 0, false)
-                builder.setOngoing(true).setAutoCancel(false)
-                    .setSmallIcon(android.R.drawable.ic_media_pause)
-                builder.addAction(android.R.drawable.ic_media_play, "Resume", resumePendingIntent)
-                builder.addAction(
-                    android.R.drawable.ic_menu_close_clear_cancel,
-                    "Cancel",
-                    cancelPendingIntent
-                )
-            }
+    builder
+      .setContentText("$msgPaused – $progressPercentage")
+      .setProgress(0, 0, false)
+      .setOngoing(true)
+      .setAutoCancel(false)
+      .setSmallIcon(android.R.drawable.ic_media_pause)
+      .addAction(
+        android.R.drawable.ic_media_play,
+        "Resume",
+        resumePendingIntent
+      )
+      .addAction(
+        android.R.drawable.ic_menu_close_clear_cancel,
+        "Cancel",
+        cancelPendingIntent
+      )
+}
+
 
             DownloadStatus.CANCELED -> {
-                builder.setContentText(msgCanceled).setProgress(0, 0, false)
-                builder.setOngoing(false).setAutoCancel(true)
+                builder.setContentText(msgCanceled)
+                    .setProgress(0, 0, false)
+                    .setOngoing(false)
+                    .setAutoCancel(true)
                     .setSmallIcon(android.R.drawable.stat_notify_error)
             }
 
             DownloadStatus.FAILED -> {
-                builder.setContentText(msgFailed).setProgress(0, 0, false)
-                builder.setOngoing(false).setAutoCancel(true)
+                builder.setContentText(msgFailed)
+                    .setProgress(0, 0, false)
+                    .setOngoing(false)
+                    .setAutoCancel(true)
                     .setSmallIcon(android.R.drawable.stat_notify_error)
             }
 
             DownloadStatus.COMPLETE -> {
-                builder.setContentText(msgComplete).setProgress(0, 0, false)
-                builder.setOngoing(false).setAutoCancel(true)
+                builder.setContentText(msgComplete)
+                    .setProgress(0, 0, false)
+                    .setOngoing(false)
+                    .setAutoCancel(true)
                     .setSmallIcon(android.R.drawable.stat_sys_download_done)
             }
 
             else -> {
                 builder.setProgress(0, 0, false)
-                builder.setOngoing(false).setAutoCancel(true).setSmallIcon(notificationIconRes)
+                    .setOngoing(false)
+                    .setAutoCancel(true)
+                    .setSmallIcon(notificationIconRes)
             }
         }
 
+        // Throttle notification updates to at most once per second, unless “finalize=true”
         if (System.currentTimeMillis() - lastCallUpdateNotification < 1000) {
             if (finalize) {
-                log("Update too frequently!!!!, but it is the final update, we should sleep a second to ensure the update call can be processed")
+                log("Final update is more than once/sec; sleeping 1s to ensure it is processed")
                 try {
                     Thread.sleep(1000)
                 } catch (e: InterruptedException) {
                     e.printStackTrace()
                 }
             } else {
-                log("Update too frequently!!!!, this should be dropped")
+                log("Dropped too-frequent update")
                 return
             }
         }
-        log("Update notification: {notificationId: $primaryId, title: $title, status: $status, progress: $progress}")
+        log("Updating notification (ID=$primaryId, status=$status, progress=$progress)")
         NotificationManagerCompat.from(context).notify(primaryId, builder.build())
         lastCallUpdateNotification = System.currentTimeMillis()
     }
 
+    /**
+     * Instead of trying to look up a Dart callback by handle (PluginUtilities),
+     * we simply send a MethodChannel invocation back to Dart with three arguments:
+     *   [0] callbackHandle (Long),
+     *   [1] this WorkRequest’s string ID,
+     *   [2] status.ordinal,
+     *   [3] progress (Double)
+     *
+     * On the Dart side, `callbackDispatcher` will receive “updateProgress” and
+     * forward it to whatever callback the user registered.
+     */
     private fun sendUpdateProcessEvent(status: DownloadStatus, progress: Double) {
         val args: MutableList<Any> = ArrayList()
         val callbackHandle: Long = inputData.getLong(ARG_CALLBACK_HANDLE, 0)
@@ -863,10 +1151,11 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         args.add(progress)
         synchronized(isolateStarted) {
             if (!isolateStarted.get()) {
+                // Queue it until Dart signals “didInitializeDispatcher”
                 isolateQueue.add(args)
             } else {
                 Handler(applicationContext.mainLooper).post {
-                    backgroundChannel?.invokeMethod("", args)
+                    backgroundChannel?.invokeMethod("updateProgress", args)
                 }
             }
         }
@@ -901,10 +1190,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         return if (name == null) {
             null
         } else {
-            URLDecoder.decode(
-                name,
-                charset ?: "ISO-8859-1"
-            )
+            URLDecoder.decode(name, charset ?: "ISO-8859-1")
         }
     }
 
@@ -914,50 +1200,13 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
 
     private fun isImageOrVideoFile(contentType: String?): Boolean {
         val newContentType = getContentTypeWithoutCharset(contentType)
-        return newContentType != null && (newContentType.startsWith("image/") || newContentType.startsWith(
-            "video"
-        ))
+        return newContentType != null && (newContentType.startsWith("image/") ||
+                newContentType.startsWith("video"))
     }
 
     private fun isExternalStoragePath(filePath: String?): Boolean {
         val externalStorageDir: File = Environment.getExternalStorageDirectory()
-        return filePath != null && filePath.startsWith(
-            externalStorageDir.path
-        )
-    }
-
-    private fun addImageOrVideoToGallery(
-        fileName: String?,
-        filePath: String?,
-        contentType: String?
-    ) {
-        if (contentType != null && filePath != null && fileName != null) {
-            if (contentType.startsWith("image/")) {
-                val values = ContentValues()
-                values.put(MediaStore.Images.Media.TITLE, fileName)
-                values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                values.put(MediaStore.Images.Media.DESCRIPTION, "")
-                values.put(MediaStore.Images.Media.MIME_TYPE, contentType)
-                values.put(MediaStore.Images.Media.DATE_ADDED, System.currentTimeMillis())
-                values.put(MediaStore.Images.Media.DATE_TAKEN, System.currentTimeMillis())
-                values.put(MediaStore.Images.Media.DATA, filePath)
-                log("insert $values to MediaStore")
-                val contentResolver = applicationContext.contentResolver
-                contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            } else if (contentType.startsWith("video")) {
-                val values = ContentValues()
-                values.put(MediaStore.Video.Media.TITLE, fileName)
-                values.put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
-                values.put(MediaStore.Video.Media.DESCRIPTION, "")
-                values.put(MediaStore.Video.Media.MIME_TYPE, contentType)
-                values.put(MediaStore.Video.Media.DATE_ADDED, System.currentTimeMillis())
-                values.put(MediaStore.Video.Media.DATE_TAKEN, System.currentTimeMillis())
-                values.put(MediaStore.Video.Media.DATA, filePath)
-                log("insert $values to MediaStore")
-                val contentResolver = applicationContext.contentResolver
-                contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-            }
-        }
+        return filePath != null && filePath.startsWith(externalStorageDir.path)
     }
 
     private fun log(message: String) {
@@ -972,75 +1221,159 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         }
     }
 
-    // --- ADDED: Pause Download ---
+    // “Pause” a running download: set isPaused/isStopped, mark resumable, update SQLite, update notification
     private fun pauseDownload() {
         if (!isPaused) {
             log("Pausing download")
             isPaused = true
-            isStopped = true  // stop the download loop
-
-            // Mark resumable = true on pause so partial file is kept
+            isStopped = true
             taskDao?.updateTaskResumable(id.toString(), true)
             taskDao?.updateTask(id.toString(), DownloadStatus.PAUSED, lastProgress)
-
             val task = taskDao?.loadTask(id.toString())
             var filename: String? = null
             if (task != null) {
                 filename = task.filename ?: task.url.substring(task.url.lastIndexOf("/") + 1)
             }
-
             updateNotification(
                 applicationContext,
                 filename ?: "Download paused",
                 DownloadStatus.PAUSED,
                 lastProgress,
                 null,
-                false,
-            )
-        }
-    }
-
-
-    // --- ADDED: Resume Download ---
-    private fun resumeDownload() {
-        if (isPaused) {
-            log("Resuming download")
-            isPaused = false
-            isStopped = false // reset stop flag
-
-            val task = taskDao?.loadTask(id.toString())
-            var filename: String? = null
-            if (task != null) {
-                filename = task.filename
-                if (filename == null) {
-                    filename = task.url.substring(task.url.lastIndexOf("/") + 1)
-                }
-            }
-
-            taskDao?.updateTask(id.toString(), DownloadStatus.RUNNING, lastProgress)
-            updateNotification(
-                applicationContext,
-                filename ?: "Resuming download",
-                DownloadStatus.RUNNING,
-                lastProgress,
-                null,
                 false
             )
-
-            // Enqueue new WorkManager task or notify Flutter to restart the download as needed
         }
     }
 
-    // --- ADDED: Cancel Download ---
+    /**
+ * “Resume” button handler: look up exactly the paused task by ID (from the Intent extras),
+ * rebuild a OneTimeWorkRequest, update the DB’s task_id → newTaskId, and re‐enqueue.
+ */
+private fun resumeDownload(intent: Intent) {
+    // 0) (New) Ensure we have a live TaskDao/DB connection:
+    if (taskDao == null) {
+        dbHelper = TaskDbHelper.getInstance(applicationContext)
+        taskDao   = TaskDao(dbHelper!!)
+    }
+
+    // 1) Pull out the paused task’s ID from the Intent
+    val pausedTaskId = intent.getStringExtra("TASK_ID")
+    if (pausedTaskId.isNullOrEmpty()) {
+        logError("Cannot resume: no TASK_ID in Intent extras")
+        return
+    }
+
+    // 2) Load that exact row from SQLite
+    val pausedTask = taskDao?.loadTask(pausedTaskId)
+    if (pausedTask == null) {
+        logError("Cannot resume: no DB row found for ID = $pausedTaskId")
+        return
+    }
+
+    // 3) Ensure it really was paused / resumable
+    if (!pausedTask.resumable) {
+        logError("Cannot resume: task was not marked resumable = 1")
+        return
+    }
+
+    log("Resuming download for task_id = $pausedTaskId")
+
+    // 4) Gather all original parameters out of that DownloadTask
+    val originalUrl              = pausedTask.url
+    val originalSavedDir         = pausedTask.savedDir
+    val originalFileName         = pausedTask.filename
+    val originalHeaders          = pausedTask.headers
+    val originalShowNotification = pausedTask.showNotification
+    val originalOpenFileFromNotif= pausedTask.openFileFromNotification
+    val originalSaveInPublic     = pausedTask.saveInPublicStorage
+    val originalAllowCellular    = pausedTask.allowCellular
+    val originalProgress         = pausedTask.progress
+
+    // 5) Grab any “plugin-level” flags from inputData (callbackHandle, step, debug, etc.)
+    val callbackHandle = inputData.getLong(ARG_CALLBACK_HANDLE, 0L)
+    val stepSize       = inputData.getInt(ARG_STEP, 10)
+    val debugFlag      = inputData.getBoolean(ARG_DEBUG, false)
+    val ignoreSslFlag  = inputData.getBoolean(ARG_IGNORESSL, false)
+    val timeoutMs      = inputData.getInt(ARG_TIMEOUT, 15000)
+
+    // 6) Build a brand-new Data object, just like FlutterDownloader.resume(...) would
+    val newData = Data.Builder()
+        .putString(ARG_URL, originalUrl)
+        .putString(ARG_SAVED_DIR, originalSavedDir)
+        .putString(ARG_FILE_NAME, originalFileName)
+        .putString(ARG_HEADERS, originalHeaders)
+        .putBoolean(ARG_SHOW_NOTIFICATION, originalShowNotification)
+        .putBoolean(ARG_OPEN_FILE_FROM_NOTIFICATION, originalOpenFileFromNotif)
+        .putBoolean(ARG_IS_RESUME, true)
+        .putLong(ARG_CALLBACK_HANDLE, callbackHandle)
+        .putInt(ARG_STEP, stepSize)
+        .putBoolean(ARG_DEBUG, debugFlag)
+        .putBoolean(ARG_IGNORESSL, ignoreSslFlag)
+        .putBoolean(ARG_SAVE_IN_PUBLIC_STORAGE, originalSaveInPublic)
+        .putBoolean("allow_cellular", originalAllowCellular)
+        .putInt(ARG_TIMEOUT, timeoutMs)
+        .build()
+
+    // 7) Recreate exactly the same Constraints:
+    val constraints = Constraints.Builder()
+        .setRequiresStorageNotLow(true)
+        .setRequiredNetworkType(
+            if (originalAllowCellular) NetworkType.CONNECTED
+            else NetworkType.UNMETERED
+        )
+        .build()
+
+    // 8) Build a brand-new OneTimeWorkRequest pointing to this same DownloadWorker
+    val newWork = OneTimeWorkRequest.Builder(DownloadWorker::class.java)
+        .setConstraints(constraints)
+        .setBackoffCriteria(
+            androidx.work.BackoffPolicy.EXPONENTIAL,
+            10,
+            TimeUnit.SECONDS
+        )
+        .setInputData(newData)
+        .build()
+
+    val newTaskId = newWork.id.toString()
+
+    // 9) Overwrite that same DB row so “task_id → newTaskId, status=RUNNING, progress=originalProgress, resumable=false”
+    taskDao!!.updateTask(
+        /* currentTaskId = */ pausedTaskId,
+        /* newTaskId     = */ newTaskId,
+        /* status        = */ DownloadStatus.RUNNING,
+        /* progress      = */ originalProgress,
+        /* resumable     = */ false
+    )
+
+    // 10) Actually enqueue the fresh WorkRequest
+    WorkManager.getInstance(applicationContext).enqueue(newWork)
+
+    // 11) Immediately send one “updateProgress” callback into Dart
+    Handler(applicationContext.mainLooper).post {
+        backgroundChannel?.invokeMethod(
+            "updateProgress",
+            listOf(callbackHandle, newTaskId, DownloadStatus.RUNNING.ordinal, originalProgress)
+        )
+    }
+
+    // 12) Flip the notification from “Paused…” back to “Resuming…”
+    updateNotification(
+        applicationContext,
+        originalFileName ?: originalUrl.substring(originalUrl.lastIndexOf("/") + 1),
+        DownloadStatus.RUNNING,
+        originalProgress,
+        null,
+        false
+    )
+}
+
+    // “Cancel” a running or paused download: set isStopped, delete partial file, update SQLite, update notification
     private fun cancelDownload() {
         log("Canceling download")
         isPaused = false
-        isStopped = true  // stop the download loop immediately
-
-        // Mark resumable = false on cancel so partial file will be deleted
+        isStopped = true
         taskDao?.updateTaskResumable(id.toString(), false)
 
-        // Delete partial file manually here:
         val task = taskDao?.loadTask(id.toString())
         var filename: String? = null
         if (task != null) {
@@ -1052,13 +1385,10 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             val tempFile = File(saveFilePath)
             if (tempFile.exists()) {
                 val deleted = tempFile.delete()
-                log("Deleted temp file on cancel: $saveFilePath = $deleted")
+                log("Deleted partial file on cancel: $saveFilePath → $deleted")
             }
         }
-
         taskDao?.updateTask(id.toString(), DownloadStatus.CANCELED, lastProgress)
-
-        // Pass filename or fallback string to notification title
         updateNotification(
             applicationContext,
             filename ?: "Download canceled",
@@ -1083,15 +1413,19 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         const val ARG_STEP = "step"
         const val ARG_SAVE_IN_PUBLIC_STORAGE = "save_in_public_storage"
         const val ARG_IGNORESSL = "ignoreSsl"
+
         private val TAG = DownloadWorker::class.java.simpleName
         private const val BUFFER_SIZE = 4096
         private const val CHANNEL_ID = "FLUTTER_DOWNLOADER_NOTIFICATION"
+
+        // These static flags track whether the Dart side has told us “didInitializeDispatcher”
         private val isolateStarted = AtomicBoolean(false)
         private val isolateQueue = ArrayDeque<List<Any>>()
+
         private var backgroundFlutterEngine: FlutterEngine? = null
         val DO_NOT_VERIFY = HostnameVerifier { _, _ -> true }
 
-        // --- ADDED: Notification action constants ---
+        // Notification action constants
         const val ACTION_PAUSE = "vn.hunghd.flutterdownloader.action.PAUSE"
         const val ACTION_RESUME = "vn.hunghd.flutterdownloader.action.RESUME"
         const val ACTION_CANCEL = "vn.hunghd.flutterdownloader.action.CANCEL"
@@ -1129,6 +1463,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
     }
 
     init {
+        // Postpone starting the FlutterEngine until the worker is actually run
         Handler(context.mainLooper).post { startBackgroundIsolate(context) }
     }
 }

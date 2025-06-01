@@ -26,7 +26,6 @@ class _MyHomePageState extends State<MyHomePage> {
   late List<ItemHolder> _items;
   late bool _showContent;
   late bool _permissionReady;
-  late bool _saveInPublicStorage;
   late String _localPath;
   final ReceivePort _port = ReceivePort();
 
@@ -40,7 +39,6 @@ class _MyHomePageState extends State<MyHomePage> {
 
     _showContent = false;
     _permissionReady = false;
-    _saveInPublicStorage = false;
 
     _prepare();
   }
@@ -115,17 +113,6 @@ class _MyHomePageState extends State<MyHomePage> {
     return ListView(
       padding: const EdgeInsets.symmetric(vertical: 16),
       children: [
-        Row(
-          children: [
-            Checkbox(
-              value: _saveInPublicStorage,
-              onChanged: (newValue) {
-                setState(() => _saveInPublicStorage = newValue ?? false);
-              },
-            ),
-            const Text('Save in public storage'),
-          ],
-        ),
         ..._items.map(
           (item) {
             final task = item.task;
@@ -227,7 +214,7 @@ class _MyHomePageState extends State<MyHomePage> {
       url: task.link!,
       headers: {'auth': 'test_for_sql_encoding'},
       savedDir: _localPath,
-      saveInPublicStorage: _saveInPublicStorage,
+      saveInPublicStorage: true,
     );
   }
 
@@ -386,7 +373,7 @@ class _MyHomePageState extends State<MyHomePage> {
   Future<String?> _getSavedDir() async {
     String? externalStorageDirPath;
     externalStorageDirPath =
-        (await getApplicationDocumentsDirectory()).absolute.path;
+        (await getExternalStorageDirectory())!.absolute.path;
 
     return externalStorageDirPath;
   }

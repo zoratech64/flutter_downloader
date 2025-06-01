@@ -46,6 +46,11 @@ class DownloadItems {
       url:
           'http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4',
     ),
+    DownloadItem(
+      name: 'All The Devils Men',
+      url:
+          'https://cdn.removie.raha.af/videos/All-The-Devils-Men-2018-480p-Movie.af.mp4',
+    ),
   ];
 
   static const apks = [
