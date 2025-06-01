@@ -409,12 +409,13 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
     var times: Int
 
     try {
+        // Load current progress from DB
         val task = taskDao?.loadTask(id.toString())
         if (task != null) {
             lastProgress = task.progress
         }
 
-        // 1) Follow redirects (up to 3×) and open the connection
+        // 1) Follow redirects up to 3×
         while (true) {
             if (!visited.containsKey(url)) {
                 times = 1
@@ -450,13 +451,17 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             httpConn.instanceFollowRedirects = false
             httpConn.setRequestProperty("User-Agent", "Mozilla/5.0...")
 
-            // Apply any custom headers
+            // Apply custom headers
             setupHeaders(httpConn, headers)
 
-            // If this is a resume, add the “Range:” header
+            // If this is a resume, add the “Range:” header based on the partial file in app-specific dir
             if (isResume) {
-                downloadedBytes =
-                    setupPartialDownloadedDataHeader(httpConn, actualFilename, savedDir)
+                val resumeFile = File(savedDir, actualFilename ?: "")
+                downloadedBytes = resumeFile.length()
+                log("Resuming download: Range: bytes=$downloadedBytes-")
+                httpConn.setRequestProperty("Accept-Encoding", "identity")
+                httpConn.setRequestProperty("Range", "bytes=$downloadedBytes-")
+                httpConn.doInput = true
             }
 
             responseCode = httpConn.responseCode
@@ -479,15 +484,12 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             break
         }
 
-        // Now that we’ve built the connection (with or without a Range header), connect:
+        // Actually connect now
         httpConn!!.connect()
 
         // ────────────────────────────────────────────────────────────────────────────────
-        // If the server returns “416 Requested Range Not Satisfiable,” it means
-        // our partial file is already ≥ full length.  Treat that as “complete.”
-        if (isResume &&
-            responseCode == 416  // HTTP 416 = Requested Range Not Satisfiable
-        ) {
+        // If server returns 416, treat as “complete”
+        if (isResume && responseCode == 416) {
             log("Server responded 416 (Range Not Satisfiable); marking task as COMPLETE.")
             taskDao?.updateTask(id.toString(), DownloadStatus.COMPLETE, 100.0)
             updateNotification(
@@ -503,7 +505,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         }
         // ────────────────────────────────────────────────────────────────────────────────
 
-        // If server gives us 200 (OK) or 206 (Partial) and we haven’t been stopped:
+        // If 200 (OK) or 206 (Partial) and not canceled
         if ((responseCode == HttpURLConnection.HTTP_OK
                     || (isResume && responseCode == HttpURLConnection.HTTP_PARTIAL))
             && !isStopped
@@ -522,14 +524,13 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             val charset = getCharsetFromContentType(contentType)
             log("Charset = $charset")
 
-            // If we’re not resuming, derive the filename from headers or URL:
+            // If not resuming, derive the filename
             if (!isResume) {
                 if (actualFilename == null) {
                     val disposition: String? = httpConn.getHeaderField("Content-Disposition")
                     log("Content-Disposition = $disposition")
                     if (!disposition.isNullOrEmpty()) {
-                        actualFilename =
-                            getFileNameFromContentDisposition(disposition, charset)
+                        actualFilename = getFileNameFromContentDisposition(disposition, charset)
                     }
                     if (actualFilename.isNullOrEmpty()) {
                         actualFilename = url.substring(url.lastIndexOf("/") + 1)
@@ -548,55 +549,31 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             inputStream = httpConn.inputStream
 
             // ─────────────────────────────────────────────────────────────────────────────
-// Instead of always doing FileOutputStream(..., true) on resume, do this:
-//
-//  • On Q+ and saveInPublicStorage==true → find the MediaStore.Downloads URI and open with "wa" (append)
-//  • Otherwise → fall back to a normal FileOutputStream(..., true)
-// ─────────────────────────────────────────────────────────────────────────────
+            // Build outputStream:
+            //  • If resuming → always append to the *same* app-specific file
+            //  • Else (first download) → create new file
+            // ─────────────────────────────────────────────────────────────────────────────
 
-var savedFilePath: String? = null
-var outputStream: OutputStream? = null
+            val savedFile: File
+            if (isResume) {
+                // Always append to the same file in app-specific dir
+                savedFile = File(savedDir, actualFilename ?: "")
+                outputStream = FileOutputStream(savedFile, true)
+                // No need to copy into MediaStore now; do that only when complete
+            } else {
+                // First time download → create brand-new file
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
+                    // Still create the file in app-specific first; promote to MediaStore only when complete
+                    savedFile = createFileInAppSpecificDir(actualFilename!!, savedDir)!!
+                    outputStream = FileOutputStream(savedFile, false)
+                } else {
+                    savedFile = createFileInAppSpecificDir(actualFilename!!, savedDir)!!
+                    outputStream = FileOutputStream(savedFile, false)
+                }
+            }
+            val savedFilePath = savedFile.path
 
-if (isResume) {
-  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
-    // Try to find the existing Downloads URI for this filename
-    val downloadUri = findExistingDownloadUri(actualFilename ?: "")
-    if (downloadUri != null) {
-      // Append into that same MediaStore row
-      outputStream = applicationContext.contentResolver.openOutputStream(downloadUri, "wa")
-      savedFilePath = getMediaStoreEntryPathApi29(downloadUri)
-    } else {
-      // Fallback → create a fresh MediaStore entry and append to it
-      val newUri = createFileInPublicDownloadsDir(actualFilename, contentType)
-      outputStream = applicationContext.contentResolver.openOutputStream(newUri!!, "wa")
-      savedFilePath = getMediaStoreEntryPathApi29(newUri)
-    }
-  } else {
-    // Normal “append into app‐specific dir” (no special permissions needed)
-    val savedFile = File(savedDir, actualFilename ?: "")
-    outputStream = FileOutputStream(savedFile, true)
-    savedFilePath = savedFile.path
-  }
-} else {
-  // ── Brand-new download (overwriting or creating from scratch) ──
-  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
-    val uri = createFileInPublicDownloadsDir(actualFilename, contentType)
-    savedFilePath = getMediaStoreEntryPathApi29(uri!!)
-    val parentDir = File(savedFilePath!!).parent ?: savedDir
-    taskDao?.updateTaskSavedDir(id.toString(), parentDir)
-    outputStream = applicationContext.contentResolver.openOutputStream(uri, "w")
-  } else {
-    val file = createFileInAppSpecificDir(actualFilename!!, savedDir)
-    savedFilePath = file!!.path
-    outputStream = FileOutputStream(file, false)
-  }
-}
-// ─────────────────────────────────────────────────────────────────────────────
-
-// … now proceed with “while (inputStream.read(buffer) != -1) { … outputStream.write(…) … }” etc.
-
-
-
+            // ─────────────────────────────────────────────────────────────────────────────
 
             var count = downloadedBytes
             var bytesRead: Int
@@ -661,18 +638,37 @@ if (isResume) {
 
             // Determine final status + progress
             val loadedTask = taskDao?.loadTask(id.toString())
-            val progress = if (isStopped && loadedTask!!.resumable) lastProgress else 100.0
-            val status = if (isStopped)
+            val finalProgress = if (isStopped && loadedTask!!.resumable) lastProgress else 100.0
+            val finalStatus = if (isStopped) {
                 if (loadedTask!!.resumable) DownloadStatus.PAUSED else DownloadStatus.CANCELED
-            else
+            } else {
                 DownloadStatus.COMPLETE
+            }
+
+            if (finalStatus == DownloadStatus.COMPLETE) {
+                // Only now move into MediaStore if needed (Android Q+ + saveInPublicStorage)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
+                    // Insert the *completed* file into MediaStore.Downloads
+                    val uri = createFileInPublicDownloadsDir(actualFilename, contentType)
+                    if (uri != null) {
+                        // Copy bytes from app-specific file into this MediaStore URI
+                        context.contentResolver.openOutputStream(uri, "w")?.use { dest ->
+                            File(savedFilePath).inputStream().use { src ->
+                                src.copyTo(dest)
+                            }
+                        }
+                        // (Optionally) delete the original app-specific file now
+                        File(savedFilePath).delete()
+                    }
+                }
+            }
 
             val storage: Int = ContextCompat.checkSelfPermission(
                 applicationContext,
                 Manifest.permission.WRITE_EXTERNAL_STORAGE
             )
             var pendingIntent: PendingIntent? = null
-            if (status == DownloadStatus.COMPLETE) {
+            if (finalStatus == DownloadStatus.COMPLETE) {
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
                     if (isImageOrVideoFile(contentType) && isExternalStoragePath(savedFilePath)) {
                         addImageOrVideoToGallery(
@@ -688,7 +684,7 @@ if (isResume) {
                     ) return
                     val intent = IntentUtils.validatedFileIntent(
                         applicationContext,
-                        savedFilePath!!,
+                        savedFilePath,
                         contentType
                     )
                     if (intent != null) {
@@ -710,18 +706,18 @@ if (isResume) {
                 }
             }
 
-            taskDao!!.updateTask(id.toString(), status, progress)
+            taskDao!!.updateTask(id.toString(), finalStatus, finalProgress)
             updateNotification(
                 context,
                 actualFilename,
-                status,
-                progress,
+                finalStatus,
+                finalProgress,
                 pendingIntent,
                 true
             )
             log(if (isStopped) "Download canceled/paused" else "Download complete")
         } else {
-            // Canceled or “unexpected” response code
+            // Canceled or unexpected response code
             val loadedTask = taskDao!!.loadTask(id.toString())
             val status = if (isStopped)
                 if (loadedTask!!.resumable) DownloadStatus.PAUSED else DownloadStatus.CANCELED
@@ -760,6 +756,7 @@ if (isResume) {
         httpConn?.disconnect()
     }
 }
+
 
 
     /**
@@ -1355,6 +1352,9 @@ private fun resumeDownload(intent: Intent) {
             listOf(callbackHandle, newTaskId, DownloadStatus.RUNNING.ordinal, originalProgress)
         )
     }
+
+    NotificationManagerCompat.from(applicationContext)
+        .cancel(pausedTask.primaryId)
 
     // 12) Flip the notification from “Paused…” back to “Resuming…”
     updateNotification(
