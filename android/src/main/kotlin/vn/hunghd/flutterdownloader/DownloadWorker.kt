@@ -1353,18 +1353,18 @@ private fun resumeDownload(intent: Intent) {
         )
     }
 
-    NotificationManagerCompat.from(applicationContext)
-        .cancel(pausedTask.primaryId)
+    // NotificationManagerCompat.from(applicationContext)
+    //    .cancel(pausedTask.primaryId)
 
     // 12) Flip the notification from “Paused…” back to “Resuming…”
     updateNotification(
-        applicationContext,
-        originalFileName ?: originalUrl.substring(originalUrl.lastIndexOf("/") + 1),
-        DownloadStatus.RUNNING,
-        originalProgress,
-        null,
-        false
-    )
+    applicationContext,
+    originalFileName ?: originalUrl.substring(originalUrl.lastIndexOf("/") + 1),
+    DownloadStatus.RUNNING,
+    originalProgress,
+    null,
+    false
+)
 }
 
     // “Cancel” a running or paused download: set isStopped, delete partial file, update SQLite, update notification
