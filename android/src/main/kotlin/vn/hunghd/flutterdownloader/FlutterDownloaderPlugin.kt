@@ -27,6 +27,7 @@ import java.util.concurrent.TimeUnit
 private const val invalidTaskId = "invalid_task_id"
 private const val invalidStatus = "invalid_status"
 private const val invalidData = "invalid_data"
+private const val TAG = "flutter_download_task"
 
 class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
     private var flutterChannel: MethodChannel? = null
@@ -155,9 +156,8 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
         result.success(null)
     }
 
-    private fun <T> MethodCall.requireArgument(key: String): T = requireNotNull(argument(key)) {
-        "Required key '$key' was null"
-    }
+    private fun <T> MethodCall.requireArgument(key: String): T =
+        requireNotNull(argument(key)) { "Required key '$key' was null" }
 
     private fun enqueue(call: MethodCall, result: MethodChannel.Result) {
         val url: String = call.requireArgument("url")
@@ -306,6 +306,9 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
                     )
                     WorkManager.getInstance(requireContext()).enqueue(request)
                 } else {
+                    // If the partial file was saved into public Downloads via MediaStore,
+                    // the stored savedDir might have been updated by DownloadWorker.doWork().
+                    // So it should find it—as long as we updated savedDir correctly there.
                     taskDao!!.updateTask(taskId, false)
                     result.error(
                         invalidData,
@@ -329,9 +332,17 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
         if (task != null) {
             if (task.status == DownloadStatus.FAILED || task.status == DownloadStatus.CANCELED) {
                 val request: WorkRequest = buildRequest(
-                    task.url, task.savedDir, task.filename,
-                    task.headers, task.showNotification, task.openFileFromNotification,
-                    false, requiresStorageNotLow, task.saveInPublicStorage, timeout, allowCellular = task.allowCellular
+                    task.url,
+                    task.savedDir,
+                    task.filename,
+                    task.headers,
+                    task.showNotification,
+                    task.openFileFromNotification,
+                    false,
+                    requiresStorageNotLow,
+                    task.saveInPublicStorage,
+                    timeout,
+                    allowCellular = task.allowCellular
                 )
                 val newTaskId: String = request.id.toString()
                 result.success(newTaskId)
@@ -457,7 +468,6 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
 
     companion object {
         private const val CHANNEL = "vn.hunghd/downloader"
-        private const val TAG = "flutter_download_task"
         const val SHARED_PREFERENCES_KEY = "vn.hunghd.downloader.pref"
         const val CALLBACK_DISPATCHER_HANDLE_KEY = "callback_dispatcher_handle_key"
     }

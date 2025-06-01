@@ -36,9 +36,9 @@ class FlutterDownloaderInitializer : ContentProvider() {
 
     override fun insert(uri: Uri, contentValues: ContentValues?): Uri? = null
 
-    override fun delete(uri: Uri, s: String?, strings: Array<String>?) = 0
+    override fun delete(uri: Uri, s: String?, strings: Array<String>?): Int = 0
 
-    override fun update(uri: Uri, contentValues: ContentValues?, s: String?, strings: Array<String>?) = 0
+    override fun update(uri: Uri, contentValues: ContentValues?, s: String?, strings: Array<String>?): Int = 0
 
     private fun getMaxConcurrentTaskMetadata(context: Context): Int {
         try {

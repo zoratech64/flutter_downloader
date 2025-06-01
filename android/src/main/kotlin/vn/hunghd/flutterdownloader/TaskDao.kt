@@ -221,8 +221,41 @@ class TaskDao(private val dbHelper: TaskDbHelper) {
         val contentValues = ContentValues().apply {
             put(TaskEntry.COLUMN_NAME_RESUMABLE, if (resumable) 1 else 0)
         }
-        db.update(TaskEntry.TABLE_NAME, contentValues, "${TaskEntry.COLUMN_NAME_TASK_ID}=?", arrayOf(taskId))
+        db.update(
+            TaskEntry.TABLE_NAME,
+            contentValues,
+            "${TaskEntry.COLUMN_NAME_TASK_ID}=?",
+            arrayOf(taskId)
+        )
     }
+
+    /**
+     * ─── NEW: Allow updating the saved_dir column at runtime. ───
+     * When saving into public "Downloads", the initial savedDir (app-specific)
+     * is not where MediaStore actually writes the file. We need to replace it
+     * with the real parent path so resume(...) can find the partial file.
+     */
+    fun updateTaskSavedDir(taskId: String, newSavedDir: String) {
+        val db = dbHelper.writableDatabase
+        val values = ContentValues().apply {
+            put(TaskEntry.COLUMN_NAME_SAVED_DIR, newSavedDir)
+        }
+        db.beginTransaction()
+        try {
+            db.update(
+                TaskEntry.TABLE_NAME,
+                values,
+                "${TaskEntry.COLUMN_NAME_TASK_ID} = ?",
+                arrayOf(taskId)
+            )
+            db.setTransactionSuccessful()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        } finally {
+            db.endTransaction()
+        }
+    }
+    // ───────────────────────────────────────────────────────────────────────────────────────
 
     fun deleteTask(taskId: String) {
         val db = dbHelper.writableDatabase
@@ -245,16 +278,26 @@ class TaskDao(private val dbHelper: TaskDbHelper) {
         val status = cursor.getInt(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_STATUS))
         val progress = cursor.getDouble(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_PROGRESS))
         val url = cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_URL))
-        val filename = cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_FILE_NAME))
-        val savedDir = cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_SAVED_DIR))
-        val headers = cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_HEADERS))
-        val mimeType = cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_MIME_TYPE))
-        val resumable = cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_RESUMABLE)).toInt()
-        val showNotification = cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_SHOW_NOTIFICATION)).toInt()
-        val clickToOpenDownloadedFile = cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_OPEN_FILE_FROM_NOTIFICATION)).toInt()
-        val timeCreated = cursor.getLong(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_TIME_CREATED))
-        val saveInPublicStorage = cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_SAVE_IN_PUBLIC_STORAGE)).toInt()
-        val allowCellular = cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_ALLOW_CELLULAR)).toInt()
+        val filename =
+            cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_FILE_NAME))
+        val savedDir =
+            cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_SAVED_DIR))
+        val headers =
+            cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_HEADERS))
+        val mimeType =
+            cursor.getString(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_MIME_TYPE))
+        val resumable =
+            cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_RESUMABLE)).toInt()
+        val showNotification =
+            cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_SHOW_NOTIFICATION)).toInt()
+        val clickToOpenDownloadedFile =
+            cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_OPEN_FILE_FROM_NOTIFICATION)).toInt()
+        val timeCreated =
+            cursor.getLong(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_TIME_CREATED))
+        val saveInPublicStorage =
+            cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_SAVE_IN_PUBLIC_STORAGE)).toInt()
+        val allowCellular =
+            cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_ALLOW_CELLULAR)).toInt()
         return DownloadTask(
             primaryId,
             taskId,
@@ -270,7 +313,7 @@ class TaskDao(private val dbHelper: TaskDbHelper) {
             clickToOpenDownloadedFile == 1,
             timeCreated,
             saveInPublicStorage == 1,
-            allowCellular = allowCellular == 1
+            allowCellular == 1
         )
     }
 }
