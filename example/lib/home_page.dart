@@ -148,6 +148,7 @@ class _MyHomePageState extends State<MyHomePage> {
               onActionTap: (task) {
                 if (task.status == DownloadTaskStatus.undefined) {
                   _requestDownload(task);
+                  _requestDownload(task);
                 } else if (task.status == DownloadTaskStatus.running) {
                   _pauseDownload(task);
                 } else if (task.status == DownloadTaskStatus.paused) {

@@ -107,9 +107,14 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
     private val downloadActionReceiver = object : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
         if (intent == null) return
+        // Grab the TASK_ID extra from the incoming broadcast:
+        val sentTaskId = intent.getStringExtra("TASK_ID")
+        // Only proceed if this worker’s id matches:
+        if (sentTaskId != id.toString()) return
+
         when (intent.action) {
             ACTION_PAUSE  -> pauseDownload()
-            ACTION_RESUME -> resumeDownload(intent)   // pass the Intent along
+            ACTION_RESUME -> resumeDownload(intent)   // already expects "TASK_ID" inside intent
             ACTION_CANCEL -> cancelDownload()
         }
     }
@@ -1044,12 +1049,19 @@ private fun findExistingDownloadUri(fileName: String): Uri? {
             .setPriority(NotificationCompat.PRIORITY_LOW)
 
         // Prepare “Pause,” “Resume,” “Cancel” PendingIntents:
-        val pauseIntent = Intent(ACTION_PAUSE).apply { setPackage(context.packageName) }
-        val resumeIntent = Intent(ACTION_RESUME).apply {
+        // Prepare “Pause,” “Resume,” “Cancel” PendingIntents:
+val pauseIntent = Intent(ACTION_PAUSE).apply {
     setPackage(context.packageName)
     putExtra("TASK_ID", id.toString())
 }
-        val cancelIntent = Intent(ACTION_CANCEL).apply { setPackage(context.packageName) }
+val resumeIntent = Intent(ACTION_RESUME).apply {
+    setPackage(context.packageName)
+    putExtra("TASK_ID", id.toString())
+}
+val cancelIntent = Intent(ACTION_CANCEL).apply {
+    setPackage(context.packageName)
+    putExtra("TASK_ID", id.toString())
+}
 
         val pausePendingIntent = PendingIntent.getBroadcast(
             context, 1, pauseIntent,
