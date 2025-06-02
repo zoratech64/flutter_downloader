@@ -545,52 +545,77 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
 
             // If not resuming, derive the filename
             if (!isResume) {
-                if (actualFilename == null) {
-                    val disposition: String? = httpConn.getHeaderField("Content-Disposition")
-                    log("Content-Disposition = $disposition")
-                    if (!disposition.isNullOrEmpty()) {
-                        actualFilename = getFileNameFromContentDisposition(disposition, charset)
-                    }
-                    if (actualFilename.isNullOrEmpty()) {
-                        actualFilename = url.substring(url.lastIndexOf("/") + 1)
-                        try {
-                            actualFilename = URLDecoder.decode(actualFilename, "UTF-8")
-                        } catch (e: IllegalArgumentException) {
-                            e.printStackTrace()
-                        }
-                    }
-                }
+    if (actualFilename == null) {
+        val disposition: String? = httpConn.getHeaderField("Content-Disposition")
+        log("Content-Disposition = $disposition")
+        if (!disposition.isNullOrEmpty()) {
+            actualFilename = getFileNameFromContentDisposition(disposition, charset)
+        }
+        if (actualFilename.isNullOrEmpty()) {
+            actualFilename = url.substring(url.lastIndexOf("/") + 1)
+            try {
+                actualFilename = URLDecoder.decode(actualFilename, "UTF-8")
+            } catch (e: IllegalArgumentException) {
+                e.printStackTrace()
             }
+        }
+    }
+}
+log("Resolved filename = $actualFilename")
 
-            log("Resolved filename = $actualFilename")
-            taskDao?.updateTask(id.toString(), actualFilename, contentType)
+// ─── Update database with "final" name before opening streams ───
+taskDao?.updateTask(id.toString(), actualFilename, contentType)
+inputStream = httpConn.inputStream
 
-            inputStream = httpConn.inputStream
+// ─── Build outputStream: ───
+val savedFile: File
+if (isResume) {
+    // Resuming: always append to the same file in app-specific dir
+    savedFile = File(savedDir, actualFilename ?: "")
+    outputStream = FileOutputStream(savedFile, true)
+} else {
+    // ─ Ensure the directory exists ─
+    val dirFile = File(savedDir)
+    if (!dirFile.exists()) {
+        dirFile.mkdirs()
+    }
 
-            // ─────────────────────────────────────────────────────────────────────────────
-            // Build outputStream:
-            //  • If resuming → always append to the *same* app-specific file
-            //  • Else (first download) → create new file
-            // ─────────────────────────────────────────────────────────────────────────────
+    // ─ If a file with that name already exists, pick a unique name ─
+    var finalFilename = actualFilename!!
+    val baseName: String
+    val extPart: String
 
-            val savedFile: File
-            if (isResume) {
-                // Always append to the same file in app-specific dir
-                savedFile = File(savedDir, actualFilename ?: "")
-                outputStream = FileOutputStream(savedFile, true)
-                // No need to copy into MediaStore now; do that only when complete
-            } else {
-                // First time download → create brand-new file
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
-                    // Still create the file in app-specific first; promote to MediaStore only when complete
-                    savedFile = createFileInAppSpecificDir(actualFilename!!, savedDir)!!
-                    outputStream = FileOutputStream(savedFile, false)
-                } else {
-                    savedFile = createFileInAppSpecificDir(actualFilename!!, savedDir)!!
-                    outputStream = FileOutputStream(savedFile, false)
-                }
-            }
-            val savedFilePath = savedFile.path
+    val dotIndex = finalFilename.lastIndexOf('.')
+    if (dotIndex != -1) {
+        baseName = finalFilename.substring(0, dotIndex)
+        extPart = finalFilename.substring(dotIndex)  // includes the dot, e.g. ".mp4"
+    } else {
+        baseName = finalFilename
+        extPart = ""
+    }
+
+    var candidateFile = File(savedDir, finalFilename)
+    var counter = 1
+    while (candidateFile.exists()) {
+        finalFilename = "$baseName($counter)$extPart"
+        candidateFile = File(savedDir, finalFilename)
+        counter++
+    }
+    // Now `finalFilename` is guaranteed not to collide with an existing file
+    actualFilename = finalFilename
+
+    // ─ Update DB with the adjusted filename ─
+    taskDao?.updateTask(id.toString(), actualFilename, contentType)
+
+    // ─ Finally create the brand‐new file on disk ─
+    val created = candidateFile.createNewFile()
+    if (!created) {
+        throw IOException("Could not create file: ${candidateFile.absolutePath}")
+    }
+    savedFile = candidateFile
+    outputStream = FileOutputStream(savedFile, false)
+}
+val savedFilePath = savedFile.path
 
             // ─────────────────────────────────────────────────────────────────────────────
 
