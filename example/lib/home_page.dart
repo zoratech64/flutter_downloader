@@ -148,7 +148,6 @@ class _MyHomePageState extends State<MyHomePage> {
               onActionTap: (task) {
                 if (task.status == DownloadTaskStatus.undefined) {
                   _requestDownload(task);
-                  _requestDownload(task);
                 } else if (task.status == DownloadTaskStatus.running) {
                   _pauseDownload(task);
                 } else if (task.status == DownloadTaskStatus.paused) {
@@ -211,11 +210,15 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _requestDownload(TaskInfo task) async {
+    await Permission.notification.request();
+    await Permission.storage.request();
+
     task.taskId = await FlutterDownloader.enqueue(
       url: task.link!,
       headers: {'auth': 'test_for_sql_encoding'},
       savedDir: _localPath,
       saveInPublicStorage: true,
+      timeout: 100000,
     );
   }
 
@@ -283,9 +286,6 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _prepare() async {
-    await Permission.notification.request();
-    await Permission.storage.request();
-
     final tasks = await FlutterDownloader.loadTasks();
 
     if (tasks == null) {
@@ -364,19 +364,11 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _prepareSaveDir() async {
-    _localPath = (await _getSavedDir())!;
+    _localPath = (await getExternalStorageDirectory())!.absolute.path;
     final savedDir = Directory(_localPath);
     if (!savedDir.existsSync()) {
       await savedDir.create();
     }
-  }
-
-  Future<String?> _getSavedDir() async {
-    String? externalStorageDirPath;
-    externalStorageDirPath =
-        (await getExternalStorageDirectory())!.absolute.path;
-
-    return externalStorageDirPath;
   }
 
   @override
