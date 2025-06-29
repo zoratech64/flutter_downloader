@@ -1063,20 +1063,26 @@ val cancelIntent = Intent(ACTION_CANCEL).apply {
     putExtra("TASK_ID", id.toString())
 }
 
-        val pausePendingIntent = PendingIntent.getBroadcast(
-            context, 1, pauseIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val resumePendingIntent = PendingIntent.getBroadcast(
+        val idCode = id.toString().hashCode()   // or use task.primaryId
+
+val pausePendingIntent = PendingIntent.getBroadcast(
     context,
-    2,
+    idCode,           // ← unique per-task
+    pauseIntent,
+    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+)
+val resumePendingIntent = PendingIntent.getBroadcast(
+    context,
+    idCode + 1,       // ← also unique
     resumeIntent,
     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
 )
-        val cancelPendingIntent = PendingIntent.getBroadcast(
-            context, 3, cancelIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+val cancelPendingIntent = PendingIntent.getBroadcast(
+    context,
+    idCode + 2,
+    cancelIntent,
+    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+)
 
         val progressPercentage = String.format(Locale.US, "%.2f%%", progress)
 

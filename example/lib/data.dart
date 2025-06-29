@@ -47,9 +47,16 @@ class DownloadItems {
           'http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4',
     ),
     DownloadItem(
-      name: 'All The Devils Men',
-      url:
-          'https://cdn.removie.raha.af/videos/All-The-Devils-Men-2018-480p-Movie.af.mp4',
+      name: 'Ciao Alberto 480p',
+      url: 'https://cdn.movie.af/videos/Ciao-Alberto-2021-480p-Movie.af.mp4',
+    ),
+    DownloadItem(
+      name: 'Ciao Alberto 720p',
+      url: 'https://cdn.movie.af/videos/Ciao-Alberto-2021-720p-Movie.af.mp4',
+    ),
+    DownloadItem(
+      name: 'Ciao Alberto 1080p',
+      url: 'https://cdn.movie.af/videos/Ciao-Alberto-2021-1080p-Movie.af.mp4',
     ),
   ];
 
