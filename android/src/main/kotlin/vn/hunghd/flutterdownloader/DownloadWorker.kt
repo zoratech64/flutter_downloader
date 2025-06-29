@@ -50,7 +50,6 @@ import javax.net.ssl.X509TrustManager
 import java.util.concurrent.TimeUnit
 import java.util.UUID
 import android.net.ConnectivityManager
-import java.net.SocketTimeoutException
 
 /**
  * DownloadWorker.kt
@@ -793,58 +792,36 @@ val savedFilePath = savedFile.path
                 else "HTTP $responseCode, marked FAILED"
             )
         }
-    } catch (e: SocketTimeoutException) {
-    // ─── a true “slow/no‐response” pause ───────────────────
-    taskDao!!.updateTaskResumable(id.toString(), true)
-    taskDao!!.updateTask(id.toString(), DownloadStatus.PAUSED, lastProgress)
-
-    updateNotification(
-      context,
-      actualFilename,
-      DownloadStatus.PAUSED,
-      lastProgress,
-      null,  // no click‐intent
-      false  // do not finalize
-    )
-
-    sendProgress(DownloadStatus.PAUSED, lastProgress)
-    return   // just exit downloadFile; doWork() will return SUCCESS
-}
-catch (e: IOException) {
-    // ─── now only treat *offline* as pause; everything else is real failure ───
-    val cm = context.getSystemService(ConnectivityManager::class.java)
-val cap = cm.getNetworkCapabilities(cm.activeNetwork)
-val offline = (cap == null)
-
-    if (offline) {
-      // pause on true connection drop
-      taskDao!!.updateTaskResumable(id.toString(), true)
-      taskDao!!.updateTask(id.toString(), DownloadStatus.PAUSED, lastProgress)
-
-      updateNotification(
-        context,
-        actualFilename,
-        DownloadStatus.PAUSED,
-        lastProgress,
-        null,
-        false
-      )
-      sendProgress(DownloadStatus.PAUSED, lastProgress)
-      return
+    } catch (e: IOException) {
+        if (!isNetworkAvailable()) {
+        // Treat loss of connectivity as a pause
+        log("Network lost: pausing download")
+        taskDao!!.updateTask(id.toString(), DownloadStatus.PAUSED, lastProgress)
+        updateNotification(
+            context,
+            filename ?: fileURL.substringAfterLast("/"),
+            DownloadStatus.PAUSED,
+            lastProgress,
+            null,
+            true
+        )
+        sendProgress(DownloadStatus.PAUSED, lastProgress)
+    } else {
+        // Some other I/O error → real failure
+        logError("Download error: ${e.message}")
+        taskDao!!.updateTask(id.toString(), DownloadStatus.FAILED, lastProgress)
+        updateNotification(
+            context,
+            filename ?: "Download failed",
+            DownloadStatus.FAILED,
+            -1.0,
+            null,
+            true
+        )
+        sendProgress(DownloadStatus.FAILED, -1.0)
     }
-
-    // everything else → FAILURE
-    taskDao!!.updateTask(id.toString(), DownloadStatus.FAILED, lastProgress)
-    updateNotification(
-      context,
-      actualFilename ?: "Download failed",
-      DownloadStatus.FAILED,
-      -1.0,
-      null,
-      true
-    )
-    sendProgress(DownloadStatus.FAILED, -1.0)
-} finally {
+        e.printStackTrace()
+    } finally {
         outputStream?.flush()
         outputStream?.close()
         inputStream?.close()
@@ -852,7 +829,13 @@ val offline = (cap == null)
     }
 }
 
-
+private fun isNetworkAvailable(): Boolean {
+    val cm = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE)
+            as ConnectivityManager
+    // activeNetworkInfo is nullable
+    val networkInfo = cm.activeNetworkInfo
+    return networkInfo?.isConnected == true
+}
 
 
     /**
