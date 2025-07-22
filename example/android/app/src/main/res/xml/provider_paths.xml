@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <external-path
-        name="download"
-        path="Download/" />
+  <!-- expose the entire /Android/data/<your‑app>/files/ folder -->
+  <external-files-path
+      name="app_files"
+      path="." />
+  <!-- if you still want the public Download folder, you can keep this too -->
+  <external-path
+      name="public_download"
+      path="Download/" />
 </paths>
