@@ -23,6 +23,9 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import android.os.Build
+import vn.hunghd.flutterdownloader.IntentUtils
+import android.os.Environment
 
 private const val invalidTaskId = "invalid_task_id"
 private const val invalidStatus = "invalid_status"
@@ -394,77 +397,78 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
     }
 
     private fun remove(call: MethodCall, result: MethodChannel.Result) {
-        val taskId: String = call.requireArgument("task_id")
-        val shouldDeleteContent: Boolean = call.requireArgument("should_delete_content")
-        val task = taskDao!!.loadTask(taskId)
-        if (task != null) {
-            if (task.status == DownloadStatus.ENQUEUED || task.status == DownloadStatus.RUNNING) {
-                WorkManager.getInstance(requireContext()).cancelWorkById(UUID.fromString(taskId))
-            }
-            if (shouldDeleteContent) {
-                var filename = task.filename
-                if (filename == null) {
-                    filename = task.url.substring(task.url.lastIndexOf("/") + 1, task.url.length)
-                }
-                val saveFilePath = task.savedDir + File.separator + filename
-                val tempFile = File(saveFilePath)
-                if (tempFile.exists()) {
-                    try {
-                        deleteFileInMediaStore(tempFile)
-                    } catch (e: SecurityException) {
-                        Log.d(
-                            "FlutterDownloader",
-                            "Failed to delete file in media store, will fall back to normal delete()"
-                        )
-                    }
-                    tempFile.delete()
-                }
-            }
-            taskDao!!.deleteTask(taskId)
-            NotificationManagerCompat.from(requireContext()).cancel(task.primaryId)
-            result.success(null)
+    val taskId              = call.requireArgument<String>("task_id")
+    val shouldDeleteContent = call.requireArgument<Boolean>("should_delete_content")
+    val task                = taskDao!!.loadTask(taskId)
+
+    if (task != null) {
+        if (task.status == DownloadStatus.ENQUEUED || task.status == DownloadStatus.RUNNING) {
+            WorkManager.getInstance(requireContext())
+                       .cancelWorkById(UUID.fromString(taskId))
+        }
+
+        if (shouldDeleteContent) {
+        // choose the right folder
+        val filename = task.filename
+            ?: task.url.substringAfterLast("/")
+        val tempFile = if (task.saveInPublicStorage) {
+            // public Downloads directory
+            val dl = Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_DOWNLOADS
+            )
+            File(dl, filename)
         } else {
-            result.error(invalidTaskId, "not found task corresponding to given task id", null)
+            // app‑specific folder (what you had before)
+            File(task.savedDir, filename)
+        }
+
+        Log.d(TAG, "→ remove(): target for deletion = ${tempFile.absolutePath} (exists=${tempFile.exists()})")
+
+        // 1) MediaStore delete
+        val deletedViaMediaStore = try {
+            deleteFileInMediaStore(tempFile)
+        } catch (e: Exception) {
+            Log.e(TAG, "MediaStore delete threw", e)
+            false
+        }
+        Log.d(TAG, "→ remove(): MediaStore.delete returned $deletedViaMediaStore")
+
+        // 2) Fallback raw delete
+        if (tempFile.exists()) {
+            val rawOk = tempFile.delete()
+            Log.d(TAG, "→ remove(): File.delete() returned $rawOk")
+        } else {
+            Log.d(TAG, "→ remove(): file no longer exists after MediaStore step")
         }
     }
 
-    private fun deleteFileInMediaStore(file: File) {
-        // Set up the projection (we only need the ID)
-        val projection = arrayOf(MediaStore.Images.Media._ID)
-
-        // Match on the file path
-        val imageSelection: String = MediaStore.Images.Media.DATA + " = ?"
-        val selectionArgs = arrayOf<String>(file.absolutePath)
-
-        // Query for the ID of the media matching the file path
-        val imageQueryUri: Uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        val contentResolver: ContentResolver = requireContext().contentResolver
-
-        // search the file in image store first
-        val imageCursor = contentResolver.query(imageQueryUri, projection, imageSelection, selectionArgs, null)
-        if (imageCursor != null && imageCursor.moveToFirst()) {
-            // We found the ID. Deleting the item via the content provider will also remove the file
-            val id: Long =
-                imageCursor.getLong(imageCursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID))
-            val deleteUri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-            contentResolver.delete(deleteUri, null, null)
-        } else {
-            // File not found in image store DB, try to search in video store
-            val videoCursor = contentResolver.query(imageQueryUri, projection, imageSelection, selectionArgs, null)
-            if (videoCursor != null && videoCursor.moveToFirst()) {
-                // We found the ID. Deleting the item via the content provider will also remove the file
-                val id: Long =
-                    videoCursor.getLong(videoCursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID))
-                val deleteUri: Uri =
-                    ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-                contentResolver.delete(deleteUri, null, null)
-            } else {
-                // can not find the file in media store DB at all
-            }
-            videoCursor?.close()
-        }
-        imageCursor?.close()
+        taskDao!!.deleteTask(taskId)
+        NotificationManagerCompat.from(requireContext()).cancel(task.primaryId)
+        result.success(null)
+    } else {
+        result.error(invalidTaskId, "not found task corresponding to given task id", null)
     }
+}
+
+    private fun deleteFileInMediaStore(file: File): Boolean {
+    val resolver : ContentResolver = requireContext().contentResolver
+    val uri       = MediaStore.Files.getContentUri("external")
+    val proj      = arrayOf(MediaStore.MediaColumns._ID)
+    val sel       = "${MediaStore.MediaColumns.DATA} = ?"
+    val args      = arrayOf(file.absolutePath)
+
+    resolver.query(uri, proj, sel, args, null)?.use { cursor ->
+        if (cursor.moveToFirst()) {
+            val id        = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID))
+            val deleteUri = ContentUris.withAppendedId(uri, id)
+            val rows      = resolver.delete(deleteUri, null, null)
+            Log.d(TAG, "→ deleteFileInMediaStore: deleted rows=$rows for $id")
+            return rows > 0
+        }
+    }
+    Log.d(TAG, "→ deleteFileInMediaStore: no MediaStore entry for ${file.absolutePath}")
+    return false
+}
 
     companion object {
         private const val CHANNEL = "vn.hunghd/downloader"
