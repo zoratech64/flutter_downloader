@@ -11,6 +11,10 @@ import java.io.FileInputStream
 import java.io.IOException
 import java.net.URLConnection
 import kotlin.jvm.Synchronized
+import android.provider.MediaStore
+import android.content.ContentUris
+import androidx.annotation.RequiresApi
+import android.database.Cursor
 
 object IntentUtils {
     private fun buildIntent(context: Context, file: File, mime: String?): Intent {
@@ -31,37 +35,62 @@ object IntentUtils {
     }
 
     @Synchronized
-    fun validatedFileIntent(context: Context, path: String, contentType: String?): Intent? {
-        val file = File(path)
+fun validatedFileIntent(context: Context, path: String, contentType: String?): Intent? {
+    val file = File(path)
+
+    // If the file still exists on disk, use FileProvider as before.
+    if (file.exists()) {
         var intent = buildIntent(context, file, contentType)
-        if (canBeHandled(context, intent)) {
-            return intent
-        }
+        if (canBeHandled(context, intent)) return intent
+
+        // MIME sniffing only if the file actually exists
         var mime: String? = null
-        var inputFile: FileInputStream? = null
         try {
-            inputFile = FileInputStream(path)
-            mime = URLConnection.guessContentTypeFromStream(inputFile) // fails sometimes
-        } catch (e: Exception) {
-            e.printStackTrace()
-        } finally {
-            if (inputFile != null) {
-                try {
-                    inputFile.close()
-                } catch (e: IOException) {
-                    e.printStackTrace()
-                }
+            FileInputStream(file).use { fis ->
+                mime = URLConnection.guessContentTypeFromStream(fis)
             }
-        }
-        if (mime == null) {
-            mime = URLConnection.guessContentTypeFromName(path) // fallback to check file extension
-        }
+        } catch (_: IOException) { /* ignore */ }
+
+        if (mime == null) mime = URLConnection.guessContentTypeFromName(path)
         if (mime != null) {
             intent = buildIntent(context, file, mime)
             if (canBeHandled(context, intent)) return intent
         }
         return null
     }
+
+    // Android Q+: file was likely moved to public Downloads via MediaStore
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        val name = file.name
+        val uri = findDownloadByDisplayName(context, name) ?: return null
+
+        val mime = contentType ?: context.contentResolver.getType(uri)
+        return Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, mime)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        }.takeIf { canBeHandled(context, it) }
+    }
+
+    return null
+}
+
+// NEW helper inside IntentUtils.kt
+@RequiresApi(Build.VERSION_CODES.Q)
+private fun findDownloadByDisplayName(context: Context, fileName: String): Uri? {
+    val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+    val projection = arrayOf(MediaStore.Downloads._ID, MediaStore.Downloads.DISPLAY_NAME)
+    val sel = "${MediaStore.Downloads.DISPLAY_NAME} = ?"
+    val args = arrayOf(fileName)
+
+    return context.contentResolver
+  .query(collection, projection, sel, args, null)
+  ?.use { c: Cursor ->
+      if (c.moveToFirst()) {
+          val id = c.getLong(c.getColumnIndexOrThrow(MediaStore.Downloads._ID))
+          ContentUris.withAppendedId(collection, id)
+      } else null
+  }
+}
 
     private fun canBeHandled(context: Context, intent: Intent): Boolean {
         val manager = context.packageManager
