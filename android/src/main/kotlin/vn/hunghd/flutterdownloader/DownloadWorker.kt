@@ -699,19 +699,21 @@ val savedFilePath = savedFile.path
             if (finalStatus == DownloadStatus.COMPLETE) {
                 // Only now move into MediaStore if needed (Android Q+ + saveInPublicStorage)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
-                    // Insert the *completed* file into MediaStore.Downloads
-                    val uri = createFileInPublicDownloadsDir(actualFilename, contentType)
-                    if (uri != null) {
-                        // Copy bytes from app-specific file into this MediaStore URI
-                        context.contentResolver.openOutputStream(uri, "w")?.use { dest ->
-                            File(savedFilePath).inputStream().use { src ->
-                                src.copyTo(dest)
-                            }
-                        }
-                        // (Optionally) delete the original app-specific file now
-                        File(savedFilePath).delete()
-                    }
-                }
+    val uri = createFileInPublicDownloadsDir(actualFilename, contentType)
+    if (uri != null) {
+        // copy and delete original...
+        context.contentResolver.openOutputStream(uri, "w")?.use { dest ->
+            File(savedFilePath).inputStream().use { src -> src.copyTo(dest) }
+        }
+        File(savedFilePath).delete()
+
+        // NEW: point the task to the public Downloads directory
+        val publicDownloadsDir = Environment
+            .getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            .absolutePath
+        taskDao?.updateTaskSavedDir(id.toString(), publicDownloadsDir)
+    }
+}
             }
 
             val storage: Int = ContextCompat.checkSelfPermission(
