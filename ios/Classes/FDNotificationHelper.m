@@ -90,7 +90,11 @@ NSString * const FDUserInfoState  = @"fd.userInfo.state";
 + (void)_enqueue:(UNMutableNotificationContent *)content id:(NSString *)identifier {
   UNTimeIntervalNotificationTrigger *t = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.1 repeats:NO];
   UNNotificationRequest *r = [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:t];
-  [[self center] addNotificationRequest:r withCompletionHandler:nil];
+  [[self center] addNotificationRequest:r withCompletionHandler:^(NSError * _Nullable error) {
+    if (error) {
+      NSLog(@"[FDNotificationHelper] addNotificationRequest error: %@", error);
+    }
+  }];
 }
 
 + (void)showOrUpdateForTaskId:(NSString *)taskId

@@ -318,6 +318,19 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     }
 }
 
+// Foreground presentation (iOS 10+)
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+       willPresentNotification:(UNNotification *)notification
+         withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler
+{
+    // Show banner + play sound when app is open
+    if (@available(iOS 14.0, *)) {
+        completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound | UNNotificationPresentationOptionList);
+    } else {
+        completionHandler(UNNotificationPresentationOptionAlert | UNNotificationPresentationOptionSound);
+    }
+}
+
 - (void)executeInDatabaseQueueForTask:(void (^)(void))task {
     __typeof__(self) __weak weakSelf = self;
     dispatch_sync(databaseQueue, ^{
@@ -1081,56 +1094,73 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
 }
 
 # pragma mark - NSURLSessionTaskDelegate
-- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
+- (void)URLSession:(NSURLSession *)session
+      downloadTask:(NSURLSessionDownloadTask *)downloadTask
+      didWriteData:(int64_t)bytesWritten
+ totalBytesWritten:(int64_t)totalBytesWritten
+totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
 {
-    if (totalBytesExpectedToWrite == NSURLSessionTransferSizeUnknown) {
-        if (debug) {
-            NSLog(@"Unknown transfer size");
-        }
+    NSString *taskId = [self identifierForTask:downloadTask];
+
+    int progress;
+    BOOL hasKnownSize = (totalBytesExpectedToWrite != NSURLSessionTransferSizeUnknown);
+    if (hasKnownSize && totalBytesExpectedToWrite > 0) {
+        progress = (int)llround((totalBytesWritten * 100.0) / (double)totalBytesExpectedToWrite);
+        if (progress < 0) progress = 0;
+        if (progress > 100) progress = 100;
     } else {
-        NSString *taskId = [self identifierForTask:downloadTask];
-        int progress = round(totalBytesWritten * 100 / (double)totalBytesExpectedToWrite);
-        NSNumber *lastProgress = _runningTaskById[taskId][KEY_PROGRESS];
-        if (([lastProgress doubleValue] == 0 || (progress > ([lastProgress doubleValue] + _step)) || progress == 100) && progress != [lastProgress doubleValue]) {
-            
-            NSNumber *status;
-            if (downloadTask.state == NSURLSessionTaskStateRunning) {
-                status = @(STATUS_RUNNING);
-            } else {
-                NSDictionary *taskDict = [self loadTaskWithId:taskId];
-                status = taskDict[@"status"];
-            }
-            
-            [self sendUpdateProgressForTaskId:taskId inStatus:status andProgress:@(progress)];
-            __typeof__(self) __weak weakSelf = self;
-            [self executeInDatabaseQueueForTask:^{
-                [weakSelf updateTask:taskId status:status.intValue progress:progress];
-            }];
-            _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
+        // Fallback: still surface activity so users see notifications
+        // 0% → 50% once data flows, creep toward 99% until finish callback fires
+        progress = (totalBytesWritten > 0) ? 50 : 0;
+        if (progress > 99) progress = 99;
+    }
+
+    // Your existing “step” throttle for database/callback updates
+    NSNumber *lastProgress = _runningTaskById[taskId][KEY_PROGRESS];
+    if (([lastProgress intValue] == 0 || (progress > ([lastProgress intValue] + _step)) || progress == 100) && progress != [lastProgress intValue]) {
+
+        NSNumber *status;
+        if (downloadTask.state == NSURLSessionTaskStateRunning) {
+            status = @(STATUS_RUNNING);
+        } else {
+            NSDictionary *taskDict = [self loadTaskWithId:taskId];
+            status = taskDict[@"status"] ?: @(STATUS_RUNNING);
         }
-        // ===== FD Notifications: progress (throttled) =====
-        {
-            NSString *taskIdStr = taskId; // already defined above
-            NSInteger percent = progress;
 
-            // throttle: ≥5% change or ≥1s since last post
-            NSNumber *lastNum = _fd_lastPercentByTask[taskIdStr] ?: @(NSIntegerMax);
-            NSDate *lastDate = _fd_lastPostDateByTask[taskIdStr] ?: [NSDate dateWithTimeIntervalSince1970:0];
-            BOOL changedEnough = (lastNum.integerValue == NSIntegerMax) || (labs((int)(percent - lastNum.integerValue)) >= 5);
-            BOOL elapsed = ([[NSDate date] timeIntervalSinceDate:lastDate] >= 1.0);
+        [self sendUpdateProgressForTaskId:taskId inStatus:status andProgress:@(progress)];
+        __typeof__(self) __weak weakSelf = self;
+        [self executeInDatabaseQueueForTask:^{
+            [weakSelf updateTask:taskId status:status.intValue progress:progress];
+        }];
+        _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
+    }
 
-            if (changedEnough || elapsed) {
-                _fd_lastPercentByTask[taskIdStr] = @(percent);
-                _fd_lastPostDateByTask[taskIdStr] = [NSDate date];
+    // ===== FD Notifications: progress (throttled & state-aware) =====
+    NSDictionary *t = [self loadTaskWithId:taskId];
+    BOOL shouldNotify = YES;
+    NSNumber *sn = t[KEY_SHOW_NOTIFICATION];
+    if (sn != nil) { shouldNotify = [sn boolValue]; }
 
-                FDDownloadState state = (downloadTask.state == NSURLSessionTaskStateSuspended)
-                                        ? FDDownloadStatePaused : FDDownloadStateRunning;
+    if (shouldNotify) {
+        NSString *taskIdStr = taskId;
+        NSInteger percent = progress;
 
-                [FDNotificationHelper showOrUpdateForTaskId:taskIdStr
-                                                    title:(state == FDDownloadStatePaused ? @"Download paused" : @"Downloading…")
-                                                progress:percent
-                                                    state:state];
-            }
+        NSNumber *lastNum = _fd_lastPercentByTask[taskIdStr] ?: @(NSIntegerMax);
+        NSDate *lastDate = _fd_lastPostDateByTask[taskIdStr] ?: [NSDate dateWithTimeIntervalSince1970:0];
+        BOOL changedEnough = (lastNum.integerValue == NSIntegerMax) || (labs((int)(percent - lastNum.integerValue)) >= 5);
+        BOOL elapsed = ([[NSDate date] timeIntervalSinceDate:lastDate] >= 1.0);
+
+        if (changedEnough || elapsed) {
+            _fd_lastPercentByTask[taskIdStr] = @(percent);
+            _fd_lastPostDateByTask[taskIdStr] = [NSDate date];
+
+            FDDownloadState state = (downloadTask.state == NSURLSessionTaskStateSuspended)
+                                    ? FDDownloadStatePaused : FDDownloadStateRunning;
+
+            [FDNotificationHelper showOrUpdateForTaskId:taskIdStr
+                                                  title:(state == FDDownloadStatePaused ? @"Download paused" : @"Downloading…")
+                                               progress:percent
+                                                  state:state];
         }
     }
 }
