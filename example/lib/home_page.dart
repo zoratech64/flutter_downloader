@@ -72,12 +72,22 @@ class _MyHomePageState extends State<MyHomePage> {
       );
 
       if (_tasks != null && _tasks!.isNotEmpty) {
-        final task = _tasks!.firstWhere((task) => task.taskId == taskId);
-        setState(() {
-          task
-            ..status = status
-            ..progress = progress;
-        });
+        TaskInfo? task;
+        try {
+          task = _tasks!.firstWhere((task) => task.taskId == taskId);
+        } catch (e) {
+          task = null;
+        }
+
+        if (task != null) {
+          setState(() {
+            task!
+              ..status = status
+              ..progress = progress;
+          });
+        } else {
+          print('Task with id $taskId not found in local _tasks list');
+        }
       }
     });
   }
@@ -227,12 +237,20 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Future<void> _resumeDownload(TaskInfo task) async {
     final newTaskId = await FlutterDownloader.resume(taskId: task.taskId!);
-    task.taskId = newTaskId;
+    setState(() {
+      task
+        ..taskId = newTaskId
+        ..status = DownloadTaskStatus.running;
+    });
   }
 
   Future<void> _retryDownload(TaskInfo task) async {
     final newTaskId = await FlutterDownloader.retry(taskId: task.taskId!);
-    task.taskId = newTaskId;
+    setState(() {
+      task
+        ..taskId = newTaskId
+        ..status = DownloadTaskStatus.running;
+    });
   }
 
   Future<bool> _openDownloadedFile(TaskInfo? task) async {
@@ -277,6 +295,10 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _prepare() async {
+    await Permission.notification.request();
+    await Permission.storage.request();
+    await Permission.manageExternalStorage.request();
+
     final tasks = await FlutterDownloader.loadTasks();
 
     if (tasks == null) {

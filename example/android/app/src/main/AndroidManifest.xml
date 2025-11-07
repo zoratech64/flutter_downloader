@@ -35,13 +35,13 @@
             android:value="2" />
 
         <provider
-            android:name="vn.hunghd.flutterdownloader.DownloadedFileProvider"
+            android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.flutter_downloader.provider"
             android:exported="false"
             android:grantUriPermissions="true">
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/provider_paths"/>
+                android:resource="@xml/provider_paths" />
         </provider>
 
         <!-- Begin FlutterDownloader customization -->

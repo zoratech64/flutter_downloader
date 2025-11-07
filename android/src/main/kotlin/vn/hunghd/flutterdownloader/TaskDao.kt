@@ -216,6 +216,14 @@ class TaskDao(private val dbHelper: TaskDbHelper) {
         }
     }
 
+    fun updateTaskResumable(taskId: String, resumable: Boolean) {
+        val db = dbHelper.writableDatabase
+        val contentValues = ContentValues().apply {
+            put(TaskEntry.COLUMN_NAME_RESUMABLE, if (resumable) 1 else 0)
+        }
+        db.update(TaskEntry.TABLE_NAME, contentValues, "${TaskEntry.COLUMN_NAME_TASK_ID}=?", arrayOf(taskId))
+    }
+
     fun deleteTask(taskId: String) {
         val db = dbHelper.writableDatabase
         db.beginTransaction()
@@ -246,7 +254,7 @@ class TaskDao(private val dbHelper: TaskDbHelper) {
         val clickToOpenDownloadedFile = cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_OPEN_FILE_FROM_NOTIFICATION)).toInt()
         val timeCreated = cursor.getLong(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_NAME_TIME_CREATED))
         val saveInPublicStorage = cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_SAVE_IN_PUBLIC_STORAGE)).toInt()
-        val allowCelluar = cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_ALLOW_CELLULAR)).toInt()
+        val allowCellular = cursor.getShort(cursor.getColumnIndexOrThrow(TaskEntry.COLUMN_ALLOW_CELLULAR)).toInt()
         return DownloadTask(
             primaryId,
             taskId,
@@ -262,7 +270,7 @@ class TaskDao(private val dbHelper: TaskDbHelper) {
             clickToOpenDownloadedFile == 1,
             timeCreated,
             saveInPublicStorage == 1,
-            allowCellular = allowCelluar == 1
+            allowCellular = allowCellular == 1
         )
     }
 }
