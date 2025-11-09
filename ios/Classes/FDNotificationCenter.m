@@ -49,25 +49,39 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
                          body:(NSString *)body
                      category:(NSString *)category
                      userInfo:(NSDictionary *)userInfo {
-  UNUserNotificationCenter *c = [UNUserNotificationCenter currentNotificationCenter];
-  NSString *identifier = [NSString stringWithFormat:@"fd.task.%@", taskId];
 
-  [c removeDeliveredNotificationsWithIdentifiers:@[identifier]];
+  // Always hop to main to avoid UI-thread starvation or reentrancy issues.
+  dispatch_async(dispatch_get_main_queue(), ^{
+    UNUserNotificationCenter *c = [UNUserNotificationCenter currentNotificationCenter];
+    NSString *identifier = [NSString stringWithFormat:@"fd.task.%@", taskId];
 
-  UNMutableNotificationContent *content = [UNMutableNotificationContent new];
-  content.title = title ?: @"Download";
-  content.body  = body ?: @"";
-  content.sound = [UNNotificationSound defaultSound];
-  content.categoryIdentifier = category;
-  content.threadIdentifier = [NSString stringWithFormat:@"fd.download.%@", taskId];
+    // Replace the already delivered card with the latest content.
+    [c removeDeliveredNotificationsWithIdentifiers:@[identifier]];
 
-  NSMutableDictionary *info = userInfo ? [userInfo mutableCopy] : [NSMutableDictionary new];
-  info[@"task_id"] = taskId;
-  content.userInfo = info;
+    UNMutableNotificationContent *content = [UNMutableNotificationContent new];
+    content.title = title ?: @"Download";
+    content.body  = body ?: @"";
+    content.sound = [UNNotificationSound defaultSound];
+    content.categoryIdentifier = category;
+    content.threadIdentifier = [NSString stringWithFormat:@"fd.download.%@", taskId];
 
-  UNTimeIntervalNotificationTrigger *trigger = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.1 repeats:NO];
-  UNNotificationRequest *req = [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:trigger];
-  [c addNotificationRequest:req withCompletionHandler:nil];
+    NSMutableDictionary *info = userInfo ? [userInfo mutableCopy] : [NSMutableDictionary new];
+    info[@"task_id"] = taskId;
+    content.userInfo = info;
+
+    // Make banners visible even under Focus (optional but helpful).
+    if (@available(iOS 15.0, *)) {
+      content.interruptionLevel = UNNotificationInterruptionLevelTimeSensitive;
+    }
+
+    UNTimeIntervalNotificationTrigger *trigger =
+      [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.1 repeats:NO];
+
+    UNNotificationRequest *req =
+      [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:trigger];
+
+    [c addNotificationRequest:req withCompletionHandler:nil];
+  });
 }
 
 - (void)removeForTaskId:(NSString *)taskId {

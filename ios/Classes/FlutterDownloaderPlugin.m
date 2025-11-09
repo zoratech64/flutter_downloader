@@ -760,6 +760,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     }];
     result(taskId);
     [self sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_ENQUEUED) andProgress:@0];
+    [self fd_postStartingNotificationForTaskId:taskId];
 }
 
 - (void)loadTasksMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
@@ -1098,15 +1099,31 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
 {
     NSString *taskId = [self identifierForTask:downloadTask];
 
-    // Progress math
+    // Per-task timing store
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    NSMutableDictionary *t = [self fd_taskInfoForId:taskId];
+    if (!t[@"start"]) t[@"start"] = @(now);
+
+    // If literally nothing written yet, show a one-time "Connecting…" card
+    if (totalBytesWritten <= 0) {
+        if (![t[@"notifiedStart"] boolValue]) {
+            t[@"notifiedStart"] = @YES;
+            t[@"lastNotify"] = @(now);
+
+            [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                           title:[self fd_titleForTaskId:taskId]
+                                                            body:@"Starting download…"
+                                                        category:FDCategoryRunning
+                                                        userInfo:nil];
+        }
+        return; // wait for first bytes before computing speed/ETA
+    }
+
+    // Normal progress math (we have bytes now)
     double written   = (double)totalBytesWritten;
     double expected  = (double)totalBytesExpectedToWrite;
     double pct       = expected > 0 ? (written / expected) * 100.0 : 0.0;
 
-    // Timing & speed
-    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-    NSMutableDictionary *t = [self fd_taskInfoForId:taskId];
-    if (!t[@"start"]) t[@"start"] = @(now);
     NSTimeInterval start = [t[@"start"] doubleValue];
     double elapsed    = MAX(now - start, 0.001);
     double bytesPerSec = written / elapsed;
@@ -1115,13 +1132,12 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
         ? [NSString stringWithFormat:@"%.2f MB/s", bytesPerSec / 1024.0 / 1024.0]
         : [NSString stringWithFormat:@"%.0f KB/s", bytesPerSec / 1024.0];
 
-    double remaining = MAX(expected - written, 0.0);
-    int secsLeft     = bytesPerSec > 0 ? (int)llround(remaining / bytesPerSec) : -1;
-    NSString *etaText = secsLeft >= 0 ? [self fd_formatRemaining:secsLeft] : @"Unknown time left";
+    double remaining = expected > 0 ? MAX(expected - written, 0.0) : -1;
+    int secsLeft     = (bytesPerSec > 0 && remaining >= 0) ? (int)llround(remaining / bytesPerSec) : -1;
+    NSString *etaText = secsLeft >= 0 ? [self fd_formatRemaining:secsLeft] : @"Calculating…";
     NSString *percentText = [NSString stringWithFormat:@"%.2f%%", pct];
 
     // ---------- THROTTLE NOTIFICATION UPDATES ----------
-    // Post at most ~1/sec, but ALWAYS at each 5% step and when complete.
     NSTimeInterval lastNotify = t[@"lastNotify"] ? [t[@"lastNotify"] doubleValue] : 0;
     BOOL hitPercentStep = (((int)llround(pct)) % 5 == 0);
     BOOL isComplete     = (((int)llround(pct)) >= 100);
@@ -1129,7 +1145,6 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
 
     if (shouldNotify) {
         t[@"lastNotify"] = @(now);
-
         NSString *body = [NSString stringWithFormat:@"Downloading — %@ · %@ · %@",
                           percentText, speedText, etaText];
 
@@ -1141,10 +1156,8 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
     }
     // ----------------------------------------------------
 
-    // Keep existing DB / Dart throttling logic
-    if (totalBytesExpectedToWrite == NSURLSessionTransferSizeUnknown) {
-        if (debug) NSLog(@"Unknown transfer size");
-    } else {
+    // Keep your existing DB/Dart throttling
+    if (totalBytesExpectedToWrite != NSURLSessionTransferSizeUnknown) {
         int progress = (int)llround((totalBytesWritten * 100.0) / (double)totalBytesExpectedToWrite);
         NSNumber *lastProgress = _runningTaskById[taskId][KEY_PROGRESS];
 
@@ -1170,6 +1183,8 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
 
             _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
         }
+    } else {
+        if (debug) NSLog(@"Unknown transfer size");
     }
 }
 
@@ -1386,6 +1401,21 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
     self.fd_taskInfo[taskId] = info;
   }
   return info;
+}
+
+- (void)fd_postStartingNotificationForTaskId:(NSString *)taskId {
+  // init per-task timing so throttle won't suppress the very first card
+  NSMutableDictionary *t = [self fd_taskInfoForId:taskId];
+  NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+  if (!t[@"start"]) t[@"start"] = @(now);
+  t[@"lastNotify"] = @(now);
+  t[@"notifiedStart"] = @YES;
+
+  [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                 title:[self fd_titleForTaskId:taskId]
+                                                  body:@"Starting download…"
+                                              category:FDCategoryRunning
+                                              userInfo:nil];
 }
 
 - (double)fd_lastPercentForTaskId:(NSString *)taskId {
