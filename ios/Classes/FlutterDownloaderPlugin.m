@@ -1,7 +1,9 @@
 #import "FlutterDownloaderPlugin.h"
 #import "FlutterDownloaderDBManager.h"
 #import <UserNotifications/UserNotifications.h>
-#import "FDNotificationHelper.h"
+#import "FDNotificationCenter.h"
+#import "FDNotificationActionHandler.h"
+#import <UIKit/UIKit.h>
 
 #define STATUS_UNDEFINED 0
 #define STATUS_ENQUEUED 1
@@ -32,7 +34,7 @@
 #define ERROR_NOT_INITIALIZED [FlutterError errorWithCode:@"not_initialized" message:@"initialize() must called first" details:nil]
 #define ERROR_INVALID_TASK_ID [FlutterError errorWithCode:@"invalid_task_id" message:@"not found task corresponding to given task id" details:nil]
 
-@interface FlutterDownloaderPlugin()<NSURLSessionTaskDelegate, NSURLSessionDownloadDelegate, UIDocumentInteractionControllerDelegate, UNUserNotificationCenterDelegate>
+@interface FlutterDownloaderPlugin()<NSURLSessionTaskDelegate, NSURLSessionDownloadDelegate, UIDocumentInteractionControllerDelegate>
 {
     FlutterMethodChannel *_mainChannel;
     FlutterMethodChannel *_callbackChannel;
@@ -40,10 +42,6 @@
     FlutterDownloaderDBManager *_dbManager;
     NSString *_allFilesDownloadedMsg;
     NSMutableArray *_eventQueue;
-    // Notification throttle caches
-    NSMutableDictionary<NSString *, NSNumber *> *_fd_lastPercentByTask;
-    NSMutableDictionary<NSString *, NSDate *> *_fd_lastPostDateByTask;
-
 }
 
 @property(nonatomic, strong) dispatch_queue_t databaseQueue;
@@ -51,6 +49,10 @@
 /// The flag ensures that the database task avoids be marked as other status after be marked as canceled in the termination.
 @property(nonatomic, assign, getter=isDatabaseQueueTerminated) BOOL databaseQueueTerminated;
 
+@end
+
+@interface FlutterDownloaderPlugin ()
+@property(nonatomic, strong) NSMutableDictionary<NSString*, NSMutableDictionary*> *fd_taskInfo;
 @end
 
 @implementation FlutterDownloaderPlugin
@@ -66,9 +68,13 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 
 @synthesize databaseQueue;
 
+static FlutterDownloaderPlugin *_sharedInstance = nil;
++ (instancetype)sharedInstance { return _sharedInstance; }
+
 - (instancetype)init:(NSObject<FlutterPluginRegistrar> *)registrar;
 {
     if (self = [super init]) {
+        _fd_taskInfo = [[NSMutableDictionary alloc] init];
         BOOL _isolate = NO;
         if (_headlessRunner == nil) {
             _headlessRunner = [[FlutterEngine alloc] initWithName:@"FlutterDownloaderIsolate" project:nil allowHeadlessExecution:YES];
@@ -97,7 +103,6 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         NSString *dbPath = [resourceBundle pathForResource:@"download_tasks" ofType:@"sql"];
         if (debug) {
             NSLog(@"database path: %@", dbPath);
-            NSLog(@"init NSURLSession with id: %@", [[_session configuration] identifier]);
         }
         databaseQueue = dispatch_queue_create("vn.hunghd.flutter_downloader", 0);
         
@@ -127,13 +132,6 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
                 NSLog(@"init NSURLSession with id: %@", [[_session configuration] identifier]);
             }
         }
-
-        _fd_lastPercentByTask = [NSMutableDictionary new];
-        _fd_lastPostDateByTask = [NSMutableDictionary new];
-        [FDNotificationHelper prepareAndRegisterCategories];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [UNUserNotificationCenter currentNotificationCenter].delegate = (id<UNUserNotificationCenterDelegate>)self;
-        });
 
         _allFilesDownloadedMsg = [mainBundle objectForInfoDictionaryKey:@"FDAllFilesDownloadedMessage"];
         if (_allFilesDownloadedMsg == nil) {
@@ -257,10 +255,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
                 [weakSelf executeInDatabaseQueueForTask:^{
                     [weakSelf updateTask:taskId status:STATUS_PAUSED progress:progress resumable:YES];
                 }];
-                [FDNotificationHelper showOrUpdateForTaskId:taskId
-                                      title:@"Download paused"
-                                   progress:progress
-                                      state:FDDownloadStatePaused];
+                [weakSelf fd_updatePausedNotificationForTaskId:taskId];
                 return;
             }
         };
@@ -287,6 +282,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
             }
         };
     }];
+    [[FDNotificationCenter shared] removeForTaskId:taskId];
 }
 
 - (void)cancelAllTasks {
@@ -315,19 +311,6 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
          });
     } else {
         [_eventQueue addObject:args];
-    }
-}
-
-// Foreground presentation (iOS 10+)
-- (void)userNotificationCenter:(UNUserNotificationCenter *)center
-       willPresentNotification:(UNNotification *)notification
-         withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler
-{
-    // Show banner + play sound when app is open
-    if (@available(iOS 14.0, *)) {
-        completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionSound | UNNotificationPresentationOptionList);
-    } else {
-        completionHandler(UNNotificationPresentationOptionAlert | UNNotificationPresentationOptionSound);
     }
 }
 
@@ -708,53 +691,6 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     }
 }
 
-- (void)fd_findDownloadTaskByTaskId:(NSString *)taskId completion:(void(^)(NSURLSessionDownloadTask * _Nullable task))completion {
-    NSURLSession *session = [self currentSession];
-    if (!session) { if (completion) completion(nil); return; }
-    [session getTasksWithCompletionHandler:^(__unused NSArray<NSURLSessionDataTask *> *data,
-                                             __unused NSArray<NSURLSessionUploadTask *> *uploads,
-                                             NSArray<NSURLSessionDownloadTask *> *downloads) {
-        NSURLSessionDownloadTask *found = nil;
-        for (NSURLSessionDownloadTask *t in downloads) {
-            NSString *tid = [self identifierForTask:t];
-            if ([tid isEqualToString:taskId]) { found = t; break; }
-        }
-        if (completion) completion(found);
-    }];
-}
-
-// Reuse your existing resume logic without FlutterMethodCall plumbing.
-- (void)fd_resumeTaskWithId:(NSString *)taskId {
-    NSDictionary* taskDict = [self loadTaskWithId:taskId];
-    if (!taskDict) return;
-    NSNumber* status = taskDict[KEY_STATUS];
-    if ([status intValue] != STATUS_PAUSED) return;
-
-    NSURL *partialFileURL = [self fileUrlFromDict:taskDict];
-    NSData *resumeData = [NSData dataWithContentsOfURL:partialFileURL];
-    if (!resumeData) return;
-
-    NSURLSessionDownloadTask *task = [[self currentSession] downloadTaskWithResumeData:resumeData];
-    NSString *newTaskId = [self createTaskId];
-    task.taskDescription = newTaskId;
-    [task resume];
-
-    // update memory-cache & DB like your resumeMethodCall
-    NSMutableDictionary *newTask = [NSMutableDictionary dictionaryWithDictionary:taskDict];
-    newTask[KEY_STATUS] = @(STATUS_RUNNING);
-    newTask[KEY_RESUMABLE] = @(NO);
-    [_runningTaskById setObject:newTask forKey:newTaskId];
-    [_runningTaskById removeObjectForKey:taskId];
-
-    __typeof__(self) __weak weakSelf = self;
-    [self executeInDatabaseQueueForTask:^{
-        [weakSelf updateTask:taskId newTaskId:newTaskId status:STATUS_RUNNING resumable:NO];
-        NSDictionary *taskInfo = [weakSelf loadTaskWithId:newTaskId];
-        NSNumber *progress = taskInfo[KEY_PROGRESS] ?: @(0);
-        [weakSelf sendUpdateProgressForTaskId:newTaskId inStatus:@(STATUS_RUNNING) andProgress:progress];
-    }];
-}
-
 # pragma mark - FlutterDownloader
 
 - (void)initializeMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
@@ -886,7 +822,11 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
                 newTask[KEY_RESUMABLE] = @(NO);
                 [_runningTaskById setObject:newTask forKey:newTaskId];
                 [_runningTaskById removeObjectForKey:taskId];
-
+                [[FDNotificationCenter shared] postOrUpdateForTaskId:newTaskId
+                                               title:[self fd_titleForTaskId:newTaskId]
+                                                body:@"Resuming…"
+                                            category:FDCategoryRunning
+                                            userInfo:nil];
                 result(newTaskId);
 
                 __typeof__(self) __weak weakSelf = self;
@@ -910,6 +850,48 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         result(ERROR_INVALID_TASK_ID);
     }
 }
+
+- (void)resumeTaskWithId:(NSString *)taskId {
+    NSDictionary* taskDict = [self loadTaskWithId:taskId];
+    if (!taskDict) return;
+
+    NSNumber* status = taskDict[KEY_STATUS];
+    if ([status intValue] != STATUS_PAUSED) return;
+
+    NSURL *partialFileURL = [self fileUrlFromDict:taskDict];
+    if (debug) NSLog(@"[Action] Try to load resume data at url: %@", partialFileURL);
+
+    NSData *resumeData = [NSData dataWithContentsOfURL:partialFileURL];
+    if (!resumeData) return;
+
+    NSURLSessionDownloadTask *task = [[self currentSession] downloadTaskWithResumeData:resumeData];
+    NSString *newTaskId = [self createTaskId];
+    task.taskDescription = newTaskId;
+    [task resume];
+
+    // update memory-cache, assign a new taskId for paused task
+    NSMutableDictionary *newTask = [NSMutableDictionary dictionaryWithDictionary:taskDict];
+    newTask[KEY_STATUS] = @(STATUS_RUNNING);
+    newTask[KEY_RESUMABLE] = @(NO);
+    _runningTaskById[newTaskId] = newTask;
+    [_runningTaskById removeObjectForKey:taskId];
+
+    // show "Resuming…" then progress will take over
+    [[FDNotificationCenter shared] postOrUpdateForTaskId:newTaskId
+                                                   title:[self fd_titleForTaskId:newTaskId]
+                                                    body:@"Resuming…"
+                                                category:FDCategoryRunning
+                                                userInfo:nil];
+
+    __weak typeof(self) weakSelf = self;
+    [self executeInDatabaseQueueForTask:^{
+        [weakSelf updateTask:taskId newTaskId:newTaskId status:STATUS_RUNNING resumable:NO];
+        NSDictionary *t = [weakSelf loadTaskWithId:newTaskId];
+        NSNumber *progress = t[KEY_PROGRESS];
+        [weakSelf sendUpdateProgressForTaskId:newTaskId inStatus:@(STATUS_RUNNING) andProgress:progress];
+    }];
+}
+
 
 - (void)retryMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
     NSString *taskId = call.arguments[KEY_TASK_ID];
@@ -988,6 +970,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
                         [weakSelf executeInDatabaseQueueForTask:^{
                             [weakSelf deleteTask:taskId];
                         }];
+                        [[FDNotificationCenter shared] removeForTaskId:taskId];
                         return;
                     }
                 };
@@ -1023,13 +1006,50 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 
 # pragma mark - FlutterPlugin
 
-+ (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar>*)registrar {
-    [registrar addApplicationDelegate: [[FlutterDownloaderPlugin alloc] init:registrar]];
++ (void)handleNotificationActionPause:(NSString *)taskId {
+  [[[self class] sharedInstance] pauseTaskWithId:taskId];
 }
++ (void)handleNotificationActionResume:(NSString *)taskId {
+  [[[self class] sharedInstance] resumeTaskWithId:taskId];
+}
++ (void)handleNotificationActionCancel:(NSString *)taskId {
+  [[[self class] sharedInstance] cancelTaskWithId:taskId];
+}
+
++ (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar>*)registrar {
+  FlutterDownloaderPlugin *plugin = [[FlutterDownloaderPlugin alloc] init:registrar];
+  [registrar addApplicationDelegate:plugin];
+
+  _sharedInstance = plugin; // keep a shared instance for notification actions
+
+  [[FDNotificationCenter shared] registerCategories];
+  [[FDNotificationCenter shared] ensureAuthorization:^{}];
+
+  // Optional: also set from AppDelegate; safe to set here too
+  [UNUserNotificationCenter currentNotificationCenter].delegate = [FDNotificationActionHandler shared];
+}
+
 
 + (void)setPluginRegistrantCallback:(FlutterPluginRegistrantCallback)callback {
   registerPlugins = callback;
 }
+
+- (void)fd_storeResumeData:(NSData *)resumeData forTaskId:(NSString *)taskId {
+    if (!resumeData || !taskId) return;
+    NSDictionary *task = [self loadTaskWithId:taskId];
+    if (!task) return;
+
+    // We don’t have the downloadTask here; use fileUrlFromDict (same path you resume from)
+    NSURL *destinationURL = [self fileUrlFromDict:task];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:destinationURL.path]) {
+        [fm removeItemAtURL:destinationURL error:nil];
+    }
+    BOOL ok = [resumeData writeToURL:destinationURL atomically:YES];
+    if (debug) NSLog(@"store resume data for %@ : %s", taskId.UTF8String, ok ? "OK" : "FAIL");
+}
+
 
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
     if ([@"initialize" isEqualToString:call.method]) {
@@ -1069,100 +1089,71 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     return YES;
 }
 
-// iOS 10+ action handler for notification buttons
-- (void)userNotificationCenter:(UNUserNotificationCenter *)center
-didReceiveNotificationResponse:(UNNotificationResponse *)response
-         withCompletionHandler:(void (^)(void))completionHandler {
-
-    NSDictionary *info = response.notification.request.content.userInfo ?: @{};
-    NSString *taskId = info[FDUserInfoTaskId];
-    NSString *action = response.actionIdentifier;
-
-    if (taskId.length > 0) {
-        if ([action isEqualToString:FDActionPause]) {
-            // Use existing pause flow (writes DB + callback)
-            [self pauseTaskWithId:taskId];
-        } else if ([action isEqualToString:FDActionResume]) {
-            // Resume using our helper (same logic as resumeMethodCall)
-            [self fd_resumeTaskWithId:taskId];
-        } else if ([action isEqualToString:FDActionCancel]) {
-            // Existing cancel flow (writes DB + callback)
-            [self cancelTaskWithId:taskId];
-        }
-    }
-    if (completionHandler) completionHandler();
-}
-
 # pragma mark - NSURLSessionTaskDelegate
-- (void)URLSession:(NSURLSession *)session
-      downloadTask:(NSURLSessionDownloadTask *)downloadTask
-      didWriteData:(int64_t)bytesWritten
- totalBytesWritten:(int64_t)totalBytesWritten
-totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
+- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
 {
     NSString *taskId = [self identifierForTask:downloadTask];
+    double written = (double)totalBytesWritten;
+    double expected = (double)totalBytesExpectedToWrite;
+    double pct = expected > 0 ? (written/expected)*100.0 : 0.0;
 
-    int progress;
-    BOOL hasKnownSize = (totalBytesExpectedToWrite != NSURLSessionTransferSizeUnknown);
-    if (hasKnownSize && totalBytesExpectedToWrite > 0) {
-        progress = (int)llround((totalBytesWritten * 100.0) / (double)totalBytesExpectedToWrite);
-        if (progress < 0) progress = 0;
-        if (progress > 100) progress = 100;
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    // Retrieve per-task timing info
+    NSMutableDictionary *t = [self fd_taskInfoForId:taskId];
+    if (!t[@"start"]) t[@"start"] = @(now);
+    NSTimeInterval start = [t[@"start"] doubleValue];
+    double elapsed = MAX(now - start, 0.001);
+    double bytesPerSec = written / elapsed;
+
+    NSString *speedText = bytesPerSec >= 1024.0*1024.0
+    ? [NSString stringWithFormat:@"%.2f MB/s", bytesPerSec/1024.0/1024.0]
+    : [NSString stringWithFormat:@"%.0f KB/s", bytesPerSec/1024.0];
+
+    double remaining = MAX(expected - written, 0.0);
+    int secsLeft = bytesPerSec > 0 ? (int)round(remaining/bytesPerSec) : -1;
+    NSString *etaText = secsLeft >= 0 ? [self fd_formatRemaining:secsLeft] : @"Unknown time left";
+    NSString *percentText = [NSString stringWithFormat:@"%.2f%%", pct];
+
+    NSString *body = [NSString stringWithFormat:@"Downloading — %@ · %@ · %@", percentText, speedText, etaText];
+
+    [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                title:[self fd_titleForTaskId:taskId]
+                                                    body:body
+                                                category:FDCategoryRunning
+                                                userInfo:nil];
+
+    if (totalBytesExpectedToWrite == NSURLSessionTransferSizeUnknown) {
+        if (debug) {
+            NSLog(@"Unknown transfer size");
+        }
     } else {
-        // Fallback: still surface activity so users see notifications
-        // 0% → 50% once data flows, creep toward 99% until finish callback fires
-        progress = (totalBytesWritten > 0) ? 50 : 0;
-        if (progress > 99) progress = 99;
-    }
-
-    // Your existing “step” throttle for database/callback updates
-    NSNumber *lastProgress = _runningTaskById[taskId][KEY_PROGRESS];
-    if (([lastProgress intValue] == 0 || (progress > ([lastProgress intValue] + _step)) || progress == 100) && progress != [lastProgress intValue]) {
-
-        NSNumber *status;
-        if (downloadTask.state == NSURLSessionTaskStateRunning) {
-            status = @(STATUS_RUNNING);
-        } else {
-            NSDictionary *taskDict = [self loadTaskWithId:taskId];
-            status = taskDict[@"status"] ?: @(STATUS_RUNNING);
-        }
-
-        [self sendUpdateProgressForTaskId:taskId inStatus:status andProgress:@(progress)];
-        __typeof__(self) __weak weakSelf = self;
-        [self executeInDatabaseQueueForTask:^{
-            [weakSelf updateTask:taskId status:status.intValue progress:progress];
-        }];
-        _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
-    }
-
-    // ===== FD Notifications: progress (throttled & state-aware) =====
-    NSDictionary *t = [self loadTaskWithId:taskId];
-    BOOL shouldNotify = YES;
-    NSNumber *sn = t[KEY_SHOW_NOTIFICATION];
-    if (sn != nil) { shouldNotify = [sn boolValue]; }
-
-    if (shouldNotify) {
-        NSString *taskIdStr = taskId;
-        NSInteger percent = progress;
-
-        NSNumber *lastNum = _fd_lastPercentByTask[taskIdStr] ?: @(NSIntegerMax);
-        NSDate *lastDate = _fd_lastPostDateByTask[taskIdStr] ?: [NSDate dateWithTimeIntervalSince1970:0];
-        BOOL changedEnough = (lastNum.integerValue == NSIntegerMax) || (labs((int)(percent - lastNum.integerValue)) >= 5);
-        BOOL elapsed = ([[NSDate date] timeIntervalSinceDate:lastDate] >= 1.0);
-
-        if (changedEnough || elapsed) {
-            _fd_lastPercentByTask[taskIdStr] = @(percent);
-            _fd_lastPostDateByTask[taskIdStr] = [NSDate date];
-
-            FDDownloadState state = (downloadTask.state == NSURLSessionTaskStateSuspended)
-                                    ? FDDownloadStatePaused : FDDownloadStateRunning;
-
-            [FDNotificationHelper showOrUpdateForTaskId:taskIdStr
-                                                  title:(state == FDDownloadStatePaused ? @"Download paused" : @"Downloading…")
-                                               progress:percent
-                                                  state:state];
+        // NSString *taskId = [self identifierForTask:downloadTask];
+        int progress = round(totalBytesWritten * 100 / (double)totalBytesExpectedToWrite);
+        NSNumber *lastProgress = _runningTaskById[taskId][KEY_PROGRESS];
+        if (([lastProgress doubleValue] == 0 || (progress > ([lastProgress doubleValue] + _step)) || progress == 100) && progress != [lastProgress doubleValue]) {
+            
+            NSNumber *status;
+            if (downloadTask.state == NSURLSessionTaskStateRunning) {
+                status = @(STATUS_RUNNING);
+            } else {
+                NSDictionary *taskDict = [self loadTaskWithId:taskId];
+                status = taskDict[@"status"];
+            }
+            
+            [self sendUpdateProgressForTaskId:taskId inStatus:status andProgress:@(progress)];
+            __typeof__(self) __weak weakSelf = self;
+            [self executeInDatabaseQueueForTask:^{
+                [weakSelf updateTask:taskId status:status.intValue progress:progress];
+            }];
+            _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
         }
     }
+}
+
+- (NSString *)fd_formatRemaining:(int)seconds {
+  int m = seconds / 60, s = seconds % 60;
+  return m > 0 ? [NSString stringWithFormat:@"%dm %ds left", m, s]
+               : [NSString stringWithFormat:@"%ds left", s];
 }
 
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didFinishDownloadingToURL:(NSURL *)location
@@ -1206,11 +1197,6 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
             [self executeInDatabaseQueueForTask:^{
                 [weakSelf updateTask:taskId status:STATUS_COMPLETE progress:100];
             }];
-                        // ===== FD Notifications: complete =====
-            NSString *taskIdStr = taskId;
-            [_fd_lastPercentByTask removeObjectForKey:taskIdStr];
-            [_fd_lastPostDateByTask removeObjectForKey:taskIdStr];
-            [FDNotificationHelper showDoneForTaskId:taskIdStr title:@"Download complete"];
         } else {
             if (debug) {
                 NSLog(@"Unable to copy temp file. Error: %@", [error localizedDescription]);
@@ -1225,7 +1211,35 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
 
 -(void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error
 {
-    
+    if (error) {
+    NSInteger code = error.code;
+    if (code == NSURLErrorNotConnectedToInternet || code == NSURLErrorTimedOut) {
+        // Treat as PAUSED (resumable)
+        NSString *taskId = [self fd_taskIdForTask:task];
+        // If resumeData available, store it (sometimes in didComplete, sometimes via cancelByProducingResumeData previously)
+        NSData *resumeData = error.userInfo[NSURLSessionDownloadTaskResumeData];
+        if (resumeData) [self fd_storeResumeData:resumeData forTaskId:taskId];
+
+        [self fd_updatePausedNotificationForTaskId:taskId];
+        // update DB/state to PAUSED
+        return;
+    }
+    // else: real failure — show failed
+    [[FDNotificationCenter shared] postOrUpdateForTaskId:[self fd_taskIdForTask:task]
+                                                    title:[self fd_titleForTaskId:[self fd_taskIdForTask:task]]
+                                                    body:@"Download failed"
+                                                category:FDCategoryDone
+                                                userInfo:nil];
+    } else {
+    // Success
+    NSString *taskId = [self fd_taskIdForTask:task];
+    [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                    title:[self fd_titleForTaskId:taskId]
+                                                    body:@"Download complete"
+                                                category:FDCategoryDone
+                                                userInfo:nil]; // you can include path in userInfo if you want an Open action
+    }
+
     NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *) task.response;
     long httpStatusCode = (long)[httpResponse statusCode];
     
@@ -1254,16 +1268,20 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
             [self executeInDatabaseQueueForTask:^{
                 [weakSelf updateTask:taskId status:status progress:-1];
             }];
-                        // ===== FD Notifications: failed/canceled =====
-            NSString *taskIdStr = taskId;
-            [_fd_lastPercentByTask removeObjectForKey:taskIdStr];
-            [_fd_lastPostDateByTask removeObjectForKey:taskIdStr];
-
-            NSString *title = (error && error.code == NSURLErrorCancelled) ? @"Download canceled" : @"Download failed";
-            [FDNotificationHelper showFailedForTaskId:taskIdStr title:title error:error];
         }
     }
 }
+
+- (void)fd_updatePausedNotificationForTaskId:(NSString *)taskId {
+  double pct = [self fd_lastPercentForTaskId:taskId]; // store last % when pausing
+  NSString *body = [NSString stringWithFormat:@"Paused — %.2f%%", pct];
+  [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                 title:[self fd_titleForTaskId:taskId]
+                                                  body:body
+                                              category:FDCategoryPaused
+                                              userInfo:nil];
+}
+
 
 -(void)URLSessionDidFinishEventsForBackgroundURLSession:(NSURLSession *)session
 {
@@ -1326,5 +1344,40 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
         NSLog(@"Finished previewing the document");
     }
 }
+
+#pragma mark - FD helpers
+
+- (NSString *)fd_taskIdForDownloadTask:(NSURLSessionDownloadTask *)downloadTask {
+  return downloadTask.taskDescription ?: [self identifierForTask:downloadTask];
+}
+
+- (NSString *)fd_taskIdForTask:(NSURLSessionTask *)task {
+  return task.taskDescription ?: [self identifierForTask:task];
+}
+
+- (NSMutableDictionary *)fd_taskInfoForId:(NSString *)taskId {
+  if (!taskId) return nil;
+  NSMutableDictionary *info = self.fd_taskInfo[taskId];
+  if (!info) {
+    info = [NSMutableDictionary dictionary];
+    self.fd_taskInfo[taskId] = info;
+  }
+  return info;
+}
+
+- (double)fd_lastPercentForTaskId:(NSString *)taskId {
+  NSNumber *p = _runningTaskById[taskId][KEY_PROGRESS];
+  return p ? p.doubleValue : 0.0;
+}
+
+- (NSString *)fd_titleForTaskId:(NSString *)taskId {
+  NSDictionary *task = [self loadTaskWithId:taskId];
+  NSString *name = task[KEY_FILE_NAME];
+  if (name && [name length] > 0) return name;
+  NSString *url = task[KEY_URL];
+  if (url.length > 0) return url.lastPathComponent ?: url;
+  return @"Download";
+}
+
 
 @end
