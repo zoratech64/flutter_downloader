@@ -1167,20 +1167,28 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 didReceiveNotificationResponse:(UNNotificationResponse *)response
          withCompletionHandler:(void (^)(void))completionHandler {
 
-    NSString *taskId = response.notification.request.content.userInfo[@"taskId"];
+    NSDictionary *info = response.notification.request.content.userInfo;
+    // We set "taskId" in FDNotificationCenter.m
+    NSString *taskId = info[@"taskId"];
     NSString *action = response.actionIdentifier;
 
-    // Match the identifiers configured by your FDNotificationCenter categories.
-    if ([action isEqualToString:@"FD_PAUSE"]) {
-        [self pauseTaskWithId:taskId];
-        [self fd_updatePausedNotificationForTaskId:taskId];
-    } else if ([action isEqualToString:@"FD_RESUME"]) {
-        [self resumeTaskWithIdFromNotification:taskId];
-    } else if ([action isEqualToString:@"FD_CANCEL"]) {
-        [self cancelTaskWithId:taskId];
-        // Notification removed by cancelTaskWithId
+    if (debug) {
+        NSLog(@"[FD] didReceiveNotificationResponse action=%@ taskId=%@", action, taskId);
     }
-    completionHandler();
+
+    if ([action isEqualToString:FDActionPause]) {
+        [self pauseTaskWithId:taskId];
+        [self fd_updatePausedNotificationForTaskId:taskId]; // keeps card, swaps to Resume/Cancel
+    } else if ([action isEqualToString:FDActionResume]) {
+        [self resumeTaskWithIdFromNotification:taskId];     // posts "Resuming…" silently
+    } else if ([action isEqualToString:FDActionCancel]) {
+        [self cancelTaskWithId:taskId];                     // removes this card
+        // (removeForTaskId is called in cancelTaskWithId)
+    } else {
+        // Tapping the body or FDActionOpen goes through your app/UI; nothing to do here.
+    }
+
+    if (completionHandler) completionHandler();
 }
 
 @end
