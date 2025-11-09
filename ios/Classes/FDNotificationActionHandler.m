@@ -1,3 +1,4 @@
+// FDNotificationActionHandler.m
 #import "FDNotificationActionHandler.h"
 #import "FDNotificationCenter.h"
 #import "FlutterDownloaderPlugin.h"
@@ -11,41 +12,26 @@
   return s;
 }
 
-// Show notifications while app is in foreground (iOS 10+)
-- (void)userNotificationCenter:(UNUserNotificationCenter *)center
-       willPresentNotification:(UNNotification *)notification
-         withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler
-{
-  if (@available(iOS 14.0, *)) {
-    completionHandler(UNNotificationPresentationOptionBanner |
-                      UNNotificationPresentationOptionList |
-                      UNNotificationPresentationOptionSound);
-  } else {
-    completionHandler(UNNotificationPresentationOptionAlert |
-                      UNNotificationPresentationOptionSound |
-                      UNNotificationPresentationOptionBadge);
-  }
+/**
+ * In the new design, the FlutterDownloaderPlugin is the UNUserNotificationCenter delegate.
+ * So this handler no longer implements those delegate callbacks.
+ * Instead, it provides helper methods to forward actions manually if ever needed.
+ */
+
+- (void)attachAsDelegateIfNeeded {
+  // Intentionally left blank — plugin sets itself as delegate.
 }
 
-// Called when user taps action buttons (Pause / Resume / Cancel) or the card
-- (void)userNotificationCenter:(UNUserNotificationCenter *)center
- didReceiveNotificationResponse:(UNNotificationResponse *)response
-          withCompletionHandler:(void (^)(void))completionHandler
-{
-  NSDictionary *info = response.notification.request.content.userInfo;
-  NSString *taskId = info[@"task_id"];
++ (void)handlePauseForTaskId:(NSString *)taskId {
+  [FlutterDownloaderPlugin handleNotificationActionPause:taskId];
+}
 
-  if ([response.actionIdentifier isEqualToString:FDActionPause]) {
-    [FlutterDownloaderPlugin handleNotificationActionPause:taskId];
-  } else if ([response.actionIdentifier isEqualToString:FDActionResume]) {
-    [FlutterDownloaderPlugin handleNotificationActionResume:taskId];
-  } else if ([response.actionIdentifier isEqualToString:FDActionCancel]) {
-    [FlutterDownloaderPlugin handleNotificationActionCancel:taskId];
-  } else {
-    // Tapping the notification body. No-op or open UI if desired.
-  }
++ (void)handleResumeForTaskId:(NSString *)taskId {
+  [FlutterDownloaderPlugin handleNotificationActionResume:taskId];
+}
 
-  if (completionHandler) completionHandler();
++ (void)handleCancelForTaskId:(NSString *)taskId {
+  [FlutterDownloaderPlugin handleNotificationActionCancel:taskId];
 }
 
 @end

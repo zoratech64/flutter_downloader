@@ -33,7 +33,7 @@
 #define ERROR_NOT_INITIALIZED [FlutterError errorWithCode:@"not_initialized" message:@"initialize() must called first" details:nil]
 #define ERROR_INVALID_TASK_ID [FlutterError errorWithCode:@"invalid_task_id" message:@"not found task corresponding to given task id" details:nil]
 
-@interface FlutterDownloaderPlugin()<NSURLSessionTaskDelegate, NSURLSessionDownloadDelegate, UIDocumentInteractionControllerDelegate>
+@interface FlutterDownloaderPlugin()<NSURLSessionTaskDelegate, NSURLSessionDownloadDelegate, UIDocumentInteractionControllerDelegate, UNUserNotificationCenterDelegate>
 {
     FlutterMethodChannel *_mainChannel;
     FlutterMethodChannel *_callbackChannel;
@@ -46,6 +46,8 @@
 @property(nonatomic, strong) dispatch_queue_t databaseQueue;
 @property(nonatomic, assign, getter=isDatabaseQueueTerminated) BOOL databaseQueueTerminated;
 @property(nonatomic, strong) NSMutableDictionary<NSString*, NSMutableDictionary*> *fd_taskInfo;
+// Tracks whether we've already shown the first banner for a given task (to suppress further banners)
+@property(nonatomic, strong) NSMutableSet<NSString *> *fd_didShowBannerForTask;
 
 @end
 
@@ -69,6 +71,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 {
     if (self = [super init]) {
         _fd_taskInfo = [[NSMutableDictionary alloc] init];
+        _fd_didShowBannerForTask = [NSMutableSet set];
         BOOL _isolate = NO;
         if (_headlessRunner == nil) {
             _headlessRunner = [[FlutterEngine alloc] initWithName:@"FlutterDownloaderIsolate" project:nil allowHeadlessExecution:YES];
@@ -131,6 +134,10 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         if (debug) {
             NSLog(@"AllFilesDownloadedMessage: %@", _allFilesDownloadedMsg);
         }
+
+        // Become the UNUserNotificationCenter delegate here so we can suppress banners after the first one.
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        center.delegate = self;
     }
 
     return self;
@@ -256,7 +263,12 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
             }
         };
     }];
+    // Remove only this notification card
     [[FDNotificationCenter shared] removeForTaskId:taskId];
+    // Also allow a fresh banner if same taskId is reused later (safety)
+    @synchronized (self) {
+        [self.fd_didShowBannerForTask removeObject:taskId];
+    }
 }
 
 - (void)cancelAllTasks {
@@ -270,6 +282,10 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                 dispatch_async(self.databaseQueue, ^{
                     [weakSelf updateTask:taskId status:STATUS_CANCELED progress:-1];
                 });
+                [[FDNotificationCenter shared] removeForTaskId:taskId];
+                @synchronized (self) {
+                    [self.fd_didShowBannerForTask removeObject:taskId];
+                }
             }
         };
     }];
@@ -625,6 +641,9 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                     NSNumber *progress = updatedTask[KEY_PROGRESS];
                     [weakSelf sendUpdateProgressForTaskId:newTaskId inStatus:@(STATUS_RUNNING) andProgress:progress];
                     
+                    // Post a silent resume update (no new banner)
+                    [weakSelf fd_postResumeNotificationForTaskId:newTaskId];
+
                     dispatch_async(dispatch_get_main_queue(), ^{
                         result(newTaskId);
                     });
@@ -672,6 +691,9 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 
                 [weakSelf updateTask:taskId newTaskId:newTaskId status:STATUS_ENQUEUED resumable:NO];
                 [weakSelf sendUpdateProgressForTaskId:newTaskId inStatus:@(STATUS_ENQUEUED) andProgress:@(0)];
+
+                // Starting banner once for the new task id
+                [weakSelf fd_postStartingNotificationForTaskId:newTaskId];
 
                 dispatch_async(dispatch_get_main_queue(), ^{
                     result(newTaskId);
@@ -748,9 +770,14 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
   FlutterDownloaderPlugin *plugin = [[FlutterDownloaderPlugin alloc] init:registrar];
   [registrar addApplicationDelegate:plugin];
   _sharedInstance = plugin;
+
+  // Keep your category setup and permission prompt via helper
   [[FDNotificationCenter shared] registerCategories];
   [[FDNotificationCenter shared] ensureAuthorization:^{}];
-  [UNUserNotificationCenter currentNotificationCenter].delegate = [FDNotificationActionHandler shared];
+
+  // Set UNUserNotificationCenter delegate to this plugin instance,
+  // so we can suppress banners for progress updates (banner shown only once).
+  [UNUserNotificationCenter currentNotificationCenter].delegate = plugin;
 }
 
 + (void)setPluginRegistrantCallback:(FlutterPluginRegistrantCallback)callback {
@@ -800,6 +827,8 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                 
                 [weakSelf updateTask:taskId newTaskId:newTaskId status:STATUS_RUNNING resumable:NO];
                 [weakSelf sendUpdateProgressForTaskId:newTaskId inStatus:@(STATUS_RUNNING) andProgress:taskDict[KEY_PROGRESS]];
+                // Silent UI update
+                [weakSelf fd_postResumeNotificationForTaskId:newTaskId];
             }
         }
     });
@@ -848,11 +877,18 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
 {
     if (totalBytesExpectedToWrite == NSURLSessionTransferSizeUnknown) {
-        return;
+        // Unknown size: still surface "activity" with partial progress (handled via notifications below).
+        // We'll avoid spamming by relying on lastNotify throttling.
     }
     
     NSString *taskId = [self identifierForTask:downloadTask];
-    int progress = (int)round((double)totalBytesWritten * 100.0 / (double)totalBytesExpectedToWrite);
+    int progress = 0;
+    if (totalBytesExpectedToWrite > 0) {
+        progress = (int)round((double)totalBytesWritten * 100.0 / (double)totalBytesExpectedToWrite);
+    } else {
+        // When size unknown, show 50..99% as "working" while data flows.
+        progress = (totalBytesWritten > 0) ? 50 : 0;
+    }
     
     @synchronized(self) {
         NSNumber *lastProgress = _runningTaskById[taskId][KEY_PROGRESS];
@@ -865,13 +901,21 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                 [weakSelf updateTask:taskId status:STATUS_RUNNING progress:progress];
             });
             
+            // Throttle notifications (no banner spam). We always "update" the same card.
             NSTimeInterval now = [NSDate date].timeIntervalSince1970;
             NSMutableDictionary *t = [self fd_taskInfoForId:taskId];
             NSTimeInterval lastNotify = t[@"lastNotify"] ? [t[@"lastNotify"] doubleValue] : 0;
             if ((now - lastNotify) >= 0.8 || progress == 100) {
                 t[@"lastNotify"] = @(now);
-                NSString *body = [NSString stringWithFormat:@"Downloading — %d%%", progress];
-                [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId title:[self fd_titleForTaskId:taskId] body:body category:FDCategoryRunning userInfo:nil];
+                NSString *body = (totalBytesExpectedToWrite > 0)
+                                 ? [NSString stringWithFormat:@"Downloading — %d%%", progress]
+                                 : @"Downloading…";
+                [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                               title:[self fd_titleForTaskId:taskId]
+                                                                body:body
+                                                            category:FDCategoryRunning
+                                                            userInfo:@{ @"taskId": taskId }
+                                                            silent:YES];
             }
         }
     }
@@ -910,12 +954,27 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                 [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_COMPLETE) andProgress:@100];
                 [weakSelf updateTask:taskId status:STATUS_COMPLETE progress:100];
                 
-                [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId title:[self fd_titleForTaskId:taskId] body:@"Download complete" category:FDCategoryDone userInfo:nil];
+                [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                               title:[self fd_titleForTaskId:taskId]
+                                                                body:@"Download complete"
+                                                            category:FDCategoryDone
+                                                            userInfo:@{ @"taskId": taskId }
+                                                            silent:YES];
             } else {
                 [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_FAILED) andProgress:@(-1)];
                 [weakSelf updateTask:taskId status:STATUS_FAILED progress:-1];
                 
-                [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId title:[self fd_titleForTaskId:taskId] body:@"Download failed" category:FDCategoryDone userInfo:nil];
+                [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                               title:[self fd_titleForTaskId:taskId]
+                                                                body:@"Download failed"
+                                                            category:FDCategoryDone
+                                                            userInfo:@{ @"taskId": taskId }
+                                                            silent:YES];
+            }
+
+            // Allow new banners for future tasks with same id if ever reused
+            @synchronized (self) {
+                [self.fd_didShowBannerForTask removeObject:taskId];
             }
         });
     }
@@ -942,7 +1001,16 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         });
         
         if(status == STATUS_FAILED){
-            [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId title:[self fd_titleForTaskId:taskId] body:@"Download failed" category:FDCategoryDone userInfo:nil];
+            [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                           title:[self fd_titleForTaskId:taskId]
+                                                            body:@"Download failed"
+                                                        category:FDCategoryDone
+                                                        userInfo:@{ @"taskId": taskId }
+                                                        silent:YES];
+        }
+
+        @synchronized (self) {
+            [self.fd_didShowBannerForTask removeObject:taskId];
         }
     }
 }
@@ -1001,10 +1069,11 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     
     dispatch_async(dispatch_get_main_queue(), ^{
         [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
-                                                         title:[self fd_titleForTaskId:taskId]
-                                                          body:@"Starting download…"
-                                                      category:FDCategoryRunning
-                                                      userInfo:nil];
+                                                       title:[self fd_titleForTaskId:taskId]
+                                                        body:@"Starting download…"
+                                                    category:FDCategoryRunning
+                                                    userInfo:@{ @"taskId": taskId }
+                                                    silent:YES];
     });
 }
 
@@ -1017,12 +1086,33 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
             NSString *body = [NSString stringWithFormat:@"Paused — %.0f%%", pct];
             dispatch_async(dispatch_get_main_queue(), ^{
                 [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
-                                                                 title:[self fd_titleForTaskId:taskId]
-                                                                  body:body
-                                                              category:FDCategoryPaused
-                                                              userInfo:nil];
+                                                               title:[self fd_titleForTaskId:taskId]
+                                                                body:body
+                                                            category:FDCategoryPaused
+                                                            userInfo:@{ @"taskId": taskId }
+                                                            silent:YES];
             });
         }
+    });
+}
+
+- (void)fd_postResumeNotificationForTaskId:(NSString *)taskId {
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.databaseQueue, ^{
+        NSDictionary* taskDict = [weakSelf loadTaskWithId:taskId];
+        double pct = 0;
+        if (taskDict) {
+            pct = [taskDict[KEY_PROGRESS] doubleValue];
+        }
+        NSString *body = (pct > 0) ? [NSString stringWithFormat:@"Resuming — %.0f%%", pct] : @"Resuming…";
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                           title:[self fd_titleForTaskId:taskId]
+                                                            body:body
+                                                        category:FDCategoryRunning
+                                                        userInfo:@{ @"taskId": taskId }
+                                                        silent:YES];
+        });
     });
 }
 
@@ -1044,6 +1134,53 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     if (url && ![url isEqual:[NSNull null]] && url.length > 0) return url.lastPathComponent ?: url;
     
     return @"Download";
+}
+
+#pragma mark - UNUserNotificationCenterDelegate (banner once + action handling)
+
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+       willPresentNotification:(UNNotification *)notification
+         withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler {
+
+    NSString *taskId = notification.request.content.userInfo[@"taskId"];
+    if (taskId && [self.fd_didShowBannerForTask containsObject:taskId]) {
+        // Suppress banners/lists for subsequent updates; keep the card updated silently.
+        completionHandler(UNNotificationPresentationOptionNone);
+    } else {
+        if (taskId) {
+            @synchronized (self) {
+                [self.fd_didShowBannerForTask addObject:taskId];
+            }
+        }
+        if (@available(iOS 14.0, *)) {
+            completionHandler(UNNotificationPresentationOptionBanner |
+                              UNNotificationPresentationOptionList |
+                              UNNotificationPresentationOptionSound);
+        } else {
+            completionHandler(UNNotificationPresentationOptionAlert |
+                              UNNotificationPresentationOptionSound);
+        }
+    }
+}
+
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+didReceiveNotificationResponse:(UNNotificationResponse *)response
+         withCompletionHandler:(void (^)(void))completionHandler {
+
+    NSString *taskId = response.notification.request.content.userInfo[@"taskId"];
+    NSString *action = response.actionIdentifier;
+
+    // Match the identifiers configured by your FDNotificationCenter categories.
+    if ([action isEqualToString:@"FD_PAUSE"]) {
+        [self pauseTaskWithId:taskId];
+        [self fd_updatePausedNotificationForTaskId:taskId];
+    } else if ([action isEqualToString:@"FD_RESUME"]) {
+        [self resumeTaskWithIdFromNotification:taskId];
+    } else if ([action isEqualToString:@"FD_CANCEL"]) {
+        [self cancelTaskWithId:taskId];
+        // Notification removed by cancelTaskWithId
+    }
+    completionHandler();
 }
 
 @end

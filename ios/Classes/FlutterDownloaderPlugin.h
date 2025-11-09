@@ -1,5 +1,6 @@
 #import <Flutter/Flutter.h>
 #import <UIKit/UIKit.h>
+#import <UserNotifications/UserNotifications.h>
 
 @interface FlutterDownloaderPlugin : NSObject <FlutterPlugin, UIApplicationDelegate>
 

@@ -60,13 +60,13 @@
     NSString *destinationPath = [self.appDirectory stringByAppendingPathComponent:self.databaseFilename];
     if (![[NSFileManager defaultManager] fileExistsAtPath:destinationPath]) {
 
-        // Attemp database file migration from the documents directory if exists
+        // Attempt database file migration from the documents directory if exists
         NSString *documentsDirectory = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
         NSString *migrationSourcePath = [documentsDirectory stringByAppendingPathComponent:self.databaseFilename];
         NSError *error;
         if ([[NSFileManager defaultManager] fileExistsAtPath:migrationSourcePath]) {
             // Migrate the database file from the documents directory to the app directory
-            [[NSFileManager defaultManager] moveItemAtPath:migrationSourcePath toPath:destinationPath error:&error];    
+            [[NSFileManager defaultManager] moveItemAtPath:migrationSourcePath toPath:destinationPath error:&error];
         } else {
             // The database file does not exist in the app directory, so copy it from the main bundle now.
             [[NSFileManager defaultManager] copyItemAtPath:self.databaseFilePath toPath:destinationPath error:&error];
@@ -136,19 +136,46 @@
                     id parameter = parameters[i];
                     int bindResult = SQLITE_OK;
 
-                    if ([parameter isKindOfClass:[NSString class]]) {
+                    if ([parameter isKindOfClass:[NSNull class]]) {
+                        bindResult = sqlite3_bind_null(compiledStatement, i + 1);
+                    } else if ([parameter isKindOfClass:[NSString class]]) {
                         const char *paramStr = [parameter UTF8String];
                         bindResult = sqlite3_bind_text(compiledStatement, i + 1, paramStr, -1, SQLITE_TRANSIENT);
                     } else if ([parameter isKindOfClass:[NSNumber class]]) {
-                        if (strcmp([parameter objCType], @encode(int)) == 0) {
-                            int intValue = [parameter intValue];
-                            bindResult = sqlite3_bind_int(compiledStatement, i + 1, intValue);
-                        } else if (strcmp([parameter objCType], @encode(long long)) == 0) {
-                            long long longValue = [parameter longLongValue];
-                            bindResult = sqlite3_bind_int64(compiledStatement, i + 1, longValue);
+                        const char *type = [((NSNumber *)parameter) objCType];
+
+                        // Handle BOOL explicitly (maps to int 0/1)
+                        if (strcmp(type, @encode(BOOL)) == 0 || strcmp(type, @encode(bool)) == 0) {
+                            bindResult = sqlite3_bind_int(compiledStatement, i + 1, [((NSNumber *)parameter) boolValue] ? 1 : 0);
                         }
+                        // Handle integer types
+                        else if (strcmp(type, @encode(int)) == 0 ||
+                                 strcmp(type, @encode(short)) == 0 ||
+                                 strcmp(type, @encode(long)) == 0 ||
+                                 strcmp(type, @encode(long long)) == 0 ||
+                                 strcmp(type, @encode(unsigned int)) == 0 ||
+                                 strcmp(type, @encode(unsigned long)) == 0 ||
+                                 strcmp(type, @encode(unsigned long long)) == 0) {
+                            bindResult = sqlite3_bind_int64(compiledStatement, i + 1, [((NSNumber *)parameter) longLongValue]);
+                        }
+                        // Handle floating point (progress as double, etc.)
+                        else if (strcmp(type, @encode(float)) == 0 ||
+                                 strcmp(type, @encode(double)) == 0) {
+                            bindResult = sqlite3_bind_double(compiledStatement, i + 1, [((NSNumber *)parameter) doubleValue]);
+                        }
+                        // Fallback: try double then integer
+                        else {
+                            bindResult = sqlite3_bind_double(compiledStatement, i + 1, [((NSNumber *)parameter) doubleValue]);
+                            if (bindResult != SQLITE_OK) {
+                                bindResult = sqlite3_bind_int64(compiledStatement, i + 1, [((NSNumber *)parameter) longLongValue]);
+                            }
+                        }
+                    } else {
+                        // Unsupported type: bind NULL to be safe
+                        bindResult = sqlite3_bind_null(compiledStatement, i + 1);
                     }
-                    if (bindResult != SQLITE_OK) {
+
+                    if (bindResult != SQLITE_OK && debug) {
                         NSLog(@"Error binding parameter at index %d: %s", i, sqlite3_errmsg(sqlite3Database));
                     }
                 }
@@ -192,6 +219,9 @@
                         if (dbDataAsChars != NULL) {
                             // Convert the characters to string.
                             [arrDataRow addObject:[NSString stringWithUTF8String:dbDataAsChars]];
+                        } else {
+                            // Preserve empty fields as NSNull to keep column alignment if needed.
+                            [arrDataRow addObject:[NSNull null]];
                         }
 
                         // Keep the current column name.
@@ -201,17 +231,15 @@
                         }
                     }
 
-                    // Store each fetched data row in the results array, but first check if there is actually data.
-                    if (arrDataRow.count > 0) {
-                        [self.arrResults addObject:arrDataRow];
-                    }
+                    // Store each fetched data row in the results array.
+                    [self.arrResults addObject:arrDataRow];
                 }
             }
 
             // Release the compiled statement from memory.
             sqlite3_finalize(compiledStatement);
         } else {
-            // In the database cannot be opened then show the error message on the debugger.
+            // If the statement cannot be prepared, show the error.
             if (debug) {
                 NSLog(@"%s", sqlite3_errmsg(sqlite3Database));
             }
@@ -224,13 +252,10 @@
 
 -(NSArray *)loadDataFromDB:(NSString *)query withParameters:(NSArray *)parameters{
     // Run the query and indicate that is not executable.
-    // The query string is converted to a char* object.
     [self runQuery:[query UTF8String] withParameters:parameters isQueryExecutable:NO];
-    // Returned the loaded results.
+    // Return the loaded results.
     return (NSArray *)self.arrResults;
 }
-
-
 
 - (void)executeQuery:(NSString *)query withParameters:(NSArray *)parameters {
     // Run the query with parameters.
