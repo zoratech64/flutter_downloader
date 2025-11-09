@@ -1090,48 +1090,69 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 }
 
 # pragma mark - NSURLSessionTaskDelegate
-- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
+- (void)URLSession:(NSURLSession *)session
+      downloadTask:(NSURLSessionDownloadTask *)downloadTask
+     didWriteData:(int64_t)bytesWritten
+totalBytesWritten:(int64_t)totalBytesWritten
+totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
 {
     NSString *taskId = [self identifierForTask:downloadTask];
-    double written = (double)totalBytesWritten;
-    double expected = (double)totalBytesExpectedToWrite;
-    double pct = expected > 0 ? (written/expected)*100.0 : 0.0;
 
+    // Progress math
+    double written   = (double)totalBytesWritten;
+    double expected  = (double)totalBytesExpectedToWrite;
+    double pct       = expected > 0 ? (written / expected) * 100.0 : 0.0;
+
+    // Timing & speed
     NSTimeInterval now = [NSDate date].timeIntervalSince1970;
-    // Retrieve per-task timing info
     NSMutableDictionary *t = [self fd_taskInfoForId:taskId];
     if (!t[@"start"]) t[@"start"] = @(now);
     NSTimeInterval start = [t[@"start"] doubleValue];
-    double elapsed = MAX(now - start, 0.001);
+    double elapsed    = MAX(now - start, 0.001);
     double bytesPerSec = written / elapsed;
 
-    NSString *speedText = bytesPerSec >= 1024.0*1024.0
-    ? [NSString stringWithFormat:@"%.2f MB/s", bytesPerSec/1024.0/1024.0]
-    : [NSString stringWithFormat:@"%.0f KB/s", bytesPerSec/1024.0];
+    NSString *speedText = (bytesPerSec >= 1024.0 * 1024.0)
+        ? [NSString stringWithFormat:@"%.2f MB/s", bytesPerSec / 1024.0 / 1024.0]
+        : [NSString stringWithFormat:@"%.0f KB/s", bytesPerSec / 1024.0];
 
     double remaining = MAX(expected - written, 0.0);
-    int secsLeft = bytesPerSec > 0 ? (int)round(remaining/bytesPerSec) : -1;
+    int secsLeft     = bytesPerSec > 0 ? (int)llround(remaining / bytesPerSec) : -1;
     NSString *etaText = secsLeft >= 0 ? [self fd_formatRemaining:secsLeft] : @"Unknown time left";
     NSString *percentText = [NSString stringWithFormat:@"%.2f%%", pct];
 
-    NSString *body = [NSString stringWithFormat:@"Downloading — %@ · %@ · %@", percentText, speedText, etaText];
+    // ---------- THROTTLE NOTIFICATION UPDATES ----------
+    // Post at most ~1/sec, but ALWAYS at each 5% step and when complete.
+    NSTimeInterval lastNotify = t[@"lastNotify"] ? [t[@"lastNotify"] doubleValue] : 0;
+    BOOL hitPercentStep = (((int)llround(pct)) % 5 == 0);
+    BOOL isComplete     = (((int)llround(pct)) >= 100);
+    BOOL shouldNotify   = ((now - lastNotify) >= 0.8) || hitPercentStep || isComplete;
 
-    [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
-                                                title:[self fd_titleForTaskId:taskId]
-                                                    body:body
-                                                category:FDCategoryRunning
-                                                userInfo:nil];
+    if (shouldNotify) {
+        t[@"lastNotify"] = @(now);
 
+        NSString *body = [NSString stringWithFormat:@"Downloading — %@ · %@ · %@",
+                          percentText, speedText, etaText];
+
+        [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                       title:[self fd_titleForTaskId:taskId]
+                                                        body:body
+                                                    category:FDCategoryRunning
+                                                    userInfo:nil];
+    }
+    // ----------------------------------------------------
+
+    // Keep existing DB / Dart throttling logic
     if (totalBytesExpectedToWrite == NSURLSessionTransferSizeUnknown) {
-        if (debug) {
-            NSLog(@"Unknown transfer size");
-        }
+        if (debug) NSLog(@"Unknown transfer size");
     } else {
-        // NSString *taskId = [self identifierForTask:downloadTask];
-        int progress = round(totalBytesWritten * 100 / (double)totalBytesExpectedToWrite);
+        int progress = (int)llround((totalBytesWritten * 100.0) / (double)totalBytesExpectedToWrite);
         NSNumber *lastProgress = _runningTaskById[taskId][KEY_PROGRESS];
-        if (([lastProgress doubleValue] == 0 || (progress > ([lastProgress doubleValue] + _step)) || progress == 100) && progress != [lastProgress doubleValue]) {
-            
+
+        if (([lastProgress doubleValue] == 0 ||
+             (progress > ([lastProgress doubleValue] + _step)) ||
+             progress == 100) &&
+            progress != [lastProgress doubleValue]) {
+
             NSNumber *status;
             if (downloadTask.state == NSURLSessionTaskStateRunning) {
                 status = @(STATUS_RUNNING);
@@ -1139,12 +1160,14 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                 NSDictionary *taskDict = [self loadTaskWithId:taskId];
                 status = taskDict[@"status"];
             }
-            
+
             [self sendUpdateProgressForTaskId:taskId inStatus:status andProgress:@(progress)];
-            __typeof__(self) __weak weakSelf = self;
+
+            __weak typeof(self) weakSelf = self;
             [self executeInDatabaseQueueForTask:^{
                 [weakSelf updateTask:taskId status:status.intValue progress:progress];
             }];
+
             _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
         }
     }
