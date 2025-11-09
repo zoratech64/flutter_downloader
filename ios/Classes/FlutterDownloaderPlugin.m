@@ -41,7 +41,6 @@
     FlutterDownloaderDBManager *_dbManager;
     NSString *_allFilesDownloadedMsg;
     NSMutableArray *_eventQueue;
-    id _backgroundTransferCompletionHandler;
 }
 
 @property(nonatomic, strong) dispatch_queue_t databaseQueue;
@@ -220,7 +219,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                     }
                 }];
 
-                // Update state
                 @synchronized(self) {
                     _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
                     _runningTaskById[taskId][KEY_STATUS] = @(STATUS_PAUSED);
@@ -291,8 +289,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     }
 }
 
-// FIX: This method should only be used for synchronous database access from a background thread.
-// It should not be called from the main thread.
 - (void)executeDbWorkSynchronously:(void (^)(void))task {
     dispatch_sync(databaseQueue, ^{
         if (self.isDatabaseQueueTerminated) return;
@@ -312,8 +308,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
             NSLog(@"initialize UIDocumentInteractionController successfully");
         }
         tmpDocController.delegate = self;
-        UIViewController *rootViewController = [UIApplication sharedApplication].delegate.window.rootViewController;
-        CGRect rect = CGRectMake(0, 0, 0, 0); // Define a rect to present from, or it may not appear on iPad.
         result = [tmpDocController presentPreviewAnimated:YES];
     }
     return result;
@@ -355,7 +349,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     if (filename == nil || [filename isEqual:[NSNull null]] || [filename isEqualToString:@""]) {
            return @"default_filename";
     }
-
     NSCharacterSet *illegalFileNameCharacters = [NSCharacterSet characterSetWithCharactersInString:@"/\\?%*|\"<>"];
     return [[filename componentsSeparatedByCharactersInSet:illegalFileNameCharacters] componentsJoinedByString:@"_"];
 }
@@ -550,16 +543,13 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                                     @(0), KEY_PROGRESS, nil];
     }
     
-    // FIX: Immediately return taskId to Flutter to not block the UI
     result(taskId);
 
     __typeof__(self) __weak weakSelf = self;
-    // FIX: Perform slow database work asynchronously
     dispatch_async(self.databaseQueue, ^{
         NSString *shortSavedDir = [weakSelf shortenSavedDirPath:savedDir];
         [weakSelf addNewTask:taskId url:urlString status:STATUS_ENQUEUED progress:0 filename:fileName savedDir:shortSavedDir headers:headers resumable:NO showNotification: [showNotification boolValue] openFileFromNotification: [openFileFromNotification boolValue]];
         
-        // Post notification and send first update AFTER DB entry is created
         [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_ENQUEUED) andProgress:@0];
         if ([showNotification boolValue]) {
             [weakSelf fd_postStartingNotificationForTaskId:taskId];
@@ -569,10 +559,8 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 
 - (void)loadTasksMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
     __typeof__(self) __weak weakSelf = self;
-    // FIX: Perform database query asynchronously
     dispatch_async(self.databaseQueue, ^{
         NSArray* tasks = [weakSelf loadAllTasks];
-        // FIX: Return result on the main thread
         dispatch_async(dispatch_get_main_queue(), ^{
             result(tasks);
         });
@@ -610,7 +598,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 - (void)resumeMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
     NSString *taskId = call.arguments[KEY_TASK_ID];
     __typeof__(self) __weak weakSelf = self;
-    // FIX: Perform database load asynchronously
     dispatch_async(self.databaseQueue, ^{
         NSDictionary* taskDict = [weakSelf loadTaskWithId:taskId];
         
@@ -770,6 +757,54 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
   registerPlugins = callback;
 }
 
+#pragma mark - Notification Actions
+
++ (void)handleNotificationActionPause:(NSString *)taskId {
+    if ([self sharedInstance]) {
+        [[self sharedInstance] pauseTaskWithId:taskId];
+    }
+}
+
++ (void)handleNotificationActionResume:(NSString *)taskId {
+    if ([self sharedInstance]) {
+        [[self sharedInstance] resumeTaskWithIdFromNotification:taskId];
+    }
+}
+
++ (void)handleNotificationActionCancel:(NSString *)taskId {
+    if ([self sharedInstance]) {
+        [[self sharedInstance] cancelTaskWithId:taskId];
+    }
+}
+
+- (void)resumeTaskWithIdFromNotification:(NSString *)taskId {
+    __typeof__(self) __weak weakSelf = self;
+    dispatch_async(self.databaseQueue, ^{
+        NSDictionary* taskDict = [weakSelf loadTaskWithId:taskId];
+        if (taskDict && [taskDict[KEY_STATUS] intValue] == STATUS_PAUSED) {
+            NSURL *partialFileURL = [weakSelf fileUrlFromDict:taskDict];
+            NSData *resumeData = [NSData dataWithContentsOfURL:partialFileURL];
+            if (resumeData) {
+                NSURLSessionDownloadTask *task = [[weakSelf currentSession] downloadTaskWithResumeData:resumeData];
+                NSString *newTaskId = [weakSelf createTaskId];
+                task.taskDescription = newTaskId;
+                [task resume];
+
+                @synchronized(self) {
+                    NSMutableDictionary *newTask = [NSMutableDictionary dictionaryWithDictionary:taskDict];
+                    newTask[KEY_STATUS] = @(STATUS_RUNNING);
+                    newTask[KEY_RESUMABLE] = @(NO);
+                    _runningTaskById[newTaskId] = newTask;
+                    [_runningTaskById removeObjectForKey:taskId];
+                }
+                
+                [weakSelf updateTask:taskId newTaskId:newTaskId status:STATUS_RUNNING resumable:NO];
+                [weakSelf sendUpdateProgressForTaskId:newTaskId inStatus:@(STATUS_RUNNING) andProgress:taskDict[KEY_PROGRESS]];
+            }
+        }
+    });
+}
+
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
     NSString *method = call.method;
     if ([@"initialize" isEqualToString:method]) {
@@ -805,7 +840,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 
 - (BOOL)application:(UIApplication *)application handleEventsForBackgroundURLSession:(NSString *)identifier completionHandler:(void (^)(void))completionHandler {
     self.backgroundTransferCompletionHandler = completionHandler;
-    // TODO: setup background isolate in case the application is re-launched from background to handle download event
     return YES;
 }
 
@@ -831,7 +865,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                 [weakSelf updateTask:taskId status:STATUS_RUNNING progress:progress];
             });
             
-            // Notification update
             NSTimeInterval now = [NSDate date].timeIntervalSince1970;
             NSMutableDictionary *t = [self fd_taskInfoForId:taskId];
             NSTimeInterval lastNotify = t[@"lastNotify"] ? [t[@"lastNotify"] doubleValue] : 0;
@@ -931,7 +964,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 
                 [[NSOperationQueue mainQueue] addOperationWithBlock:^{
                     completionHandler();
-                    // FIX: Use modern UserNotifications API instead of deprecated UILocalNotification
                     UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
                     content.body = self->_allFilesDownloadedMsg;
                     UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:[[NSUUID UUID] UUIDString] content:content trigger:nil];
@@ -1000,8 +1032,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
       task = _runningTaskById[taskId];
     }
     if (!task) {
-      // Must fetch from DB, but this method could be called from any thread,
-      // so we do it synchronously on the DB queue to prevent deadlocks.
       [self executeDbWorkSynchronously:^{
          task = [self loadTaskWithId:taskId];
       }];
