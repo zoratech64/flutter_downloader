@@ -44,6 +44,7 @@
 }
 
 @property(nonatomic, strong) dispatch_queue_t databaseQueue;
+@property(nonatomic, strong) NSMutableSet<NSString *> *fd_pausingTaskIds;
 @property(nonatomic, assign, getter=isDatabaseQueueTerminated) BOOL databaseQueueTerminated;
 @property(nonatomic, strong) NSMutableDictionary<NSString*, NSMutableDictionary*> *fd_taskInfo;
 // Tracks whether we've already shown the first banner for a given task (to suppress further banners)
@@ -71,6 +72,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 {
     if (self = [super init]) {
         _fd_taskInfo = [[NSMutableDictionary alloc] init];
+        _fd_pausingTaskIds = [NSMutableSet set];
         _fd_didShowBannerForTask = [NSMutableSet set];
         BOOL _isolate = NO;
         if (_headlessRunner == nil) {
@@ -211,7 +213,10 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
             if ([taskId isEqualToString:[weakSelf identifierForTask:download]] && (download.state == NSURLSessionTaskStateRunning)) {
                 NSDictionary *task = [weakSelf loadTaskWithId:taskId];
                 double progress = [task[@"progress"] doubleValue];
-                
+                @synchronized (self) {
+                    [self.fd_pausingTaskIds addObject:taskId];
+                }
+
                 [download cancelByProducingResumeData:^(NSData * _Nullable resumeData) {
                     if (resumeData) {
                         NSFileManager *fileManager = [NSFileManager defaultManager];
@@ -987,6 +992,19 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     long httpStatusCode = [httpResponse statusCode];
     bool isSuccess = (httpStatusCode >= 200 && httpStatusCode < 300);
 
+    // If this "cancel" was produced by an intentional PAUSE, ignore it.
+    if (error && error.code == NSURLErrorCancelled) {
+        BOOL wasPaused;
+        @synchronized (self) {
+            wasPaused = [self.fd_pausingTaskIds containsObject:taskId];
+            if (wasPaused) [self.fd_pausingTaskIds removeObject:taskId];
+        }
+        if (wasPaused) {
+            if (debug) NSLog(@"[FD] didCompleteWithError: treat NSURLErrorCancelled as PAUSED for %@", taskId);
+            return; // We've already updated DB + notification in pauseTaskWithId
+        }
+    }
+
     if (error != nil || !isSuccess) {
         int status = (error && [error code] == NSURLErrorCancelled) ? STATUS_CANCELED : STATUS_FAILED;
         
@@ -1006,7 +1024,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                                                             body:@"Download failed"
                                                         category:FDCategoryDone
                                                         userInfo:@{ @"taskId": taskId }
-                                                        silent:YES];
+                                                          silent:NO];
         }
 
         @synchronized (self) {
@@ -1161,6 +1179,13 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                               UNNotificationPresentationOptionSound);
         }
     }
+}
+
+- (NSString *)fd_taskIdFromUserInfo:(NSDictionary *)info {
+  if (!info || (id)info == [NSNull null]) return nil;
+  NSString *tid = info[@"taskId"];
+  if (!tid || (id)tid == [NSNull null] || tid.length == 0) tid = info[@"task_id"];
+  return tid;
 }
 
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center

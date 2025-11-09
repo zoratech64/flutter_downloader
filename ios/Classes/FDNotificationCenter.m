@@ -68,7 +68,8 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
     content.threadIdentifier = [NSString stringWithFormat:@"fd.download.%@", taskId];
 
     NSMutableDictionary *info = userInfo ? [userInfo mutableCopy] : [NSMutableDictionary new];
-    info[@"taskId"] = taskId; // ensure consistent key
+    info[@"taskId"]  = taskId ?: @"";
+    info[@"task_id"] = taskId ?: @"";
     content.userInfo = info;
 
     if (@available(iOS 15.0, *)) {
