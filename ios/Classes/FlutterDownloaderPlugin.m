@@ -1027,7 +1027,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 }
 
 - (NSString *)fd_titleForTaskId:(NSString *)taskId {
-    NSDictionary *task;
+    __block NSDictionary *task;
     @synchronized(self) {
       task = _runningTaskById[taskId];
     }
