@@ -804,7 +804,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 }
 
 - (BOOL)application:(UIApplication *)application handleEventsForBackgroundURLSession:(NSString *)identifier completionHandler:(void (^)(void))completionHandler {
-    self->_backgroundTransferCompletionHandler = completionHandler;
+    self.backgroundTransferCompletionHandler = completionHandler;
     // TODO: setup background isolate in case the application is re-launched from background to handle download event
     return YES;
 }
@@ -925,9 +925,9 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                 NSLog(@"all download tasks have been finished");
             }
 
-            if (self->_backgroundTransferCompletionHandler != nil) {
-                void(^completionHandler)(void) = self->_backgroundTransferCompletionHandler;
-                self->_backgroundTransferCompletionHandler = nil;
+            if (self.backgroundTransferCompletionHandler != nil) {
+                void(^completionHandler)(void) = self.backgroundTransferCompletionHandler;
+                self.backgroundTransferCompletionHandler = nil;
 
                 [[NSOperationQueue mainQueue] addOperationWithBlock:^{
                     completionHandler();
