@@ -783,6 +783,8 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
   // Set UNUserNotificationCenter delegate to this plugin instance,
   // so we can suppress banners for progress updates (banner shown only once).
   [UNUserNotificationCenter currentNotificationCenter].delegate = plugin;
+  NSLog(@"[FD] UNUserNotificationCenter.delegate = %@",
+      NSStringFromClass([UNUserNotificationCenter currentNotificationCenter].delegate.class));
 }
 
 + (void)setPluginRegistrantCallback:(FlutterPluginRegistrantCallback)callback {

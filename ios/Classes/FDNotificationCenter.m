@@ -63,12 +63,11 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
     content.title = title ?: @"Download";
     content.body  = body ?: @"";
     if (!silent) content.sound = [UNNotificationSound defaultSound];
-    content.categoryIdentifier = category;
-    content.threadIdentifier = [NSString stringWithFormat:@"fd.download.%@", taskId];
+    content.categoryIdentifier = category;                         // <- attaches actions
+    content.threadIdentifier   = [NSString stringWithFormat:@"fd.download.%@", taskId];
 
     NSMutableDictionary *info = userInfo ? [userInfo mutableCopy] : [NSMutableDictionary new];
-    // Write BOTH keys so old/new paths work
-    info[@"taskId"]  = taskId ?: @"";
+    info[@"taskId"]  = taskId ?: @"";                              // <- both keys (new & legacy)
     info[@"task_id"] = taskId ?: @"";
     content.userInfo = info;
 
@@ -77,9 +76,14 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
                                          : UNNotificationInterruptionLevelActive;
     }
 
-    // IMPORTANT: deliver immediately (no trigger) and DO NOT remove first.
+    // IMPORTANT: immediate delivery; do NOT remove previous card first
     UNNotificationRequest *req =
       [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
+
+    // (Optional) debug – leave for now while you test:
+    NSLog(@"[FD] post id=%@ cat=%@ title=%@ body=%@ silent=%@ userInfo=%@",
+          identifier, content.categoryIdentifier, content.title, content.body,
+          silent?@"YES":@"NO", content.userInfo);
 
     [c addNotificationRequest:req withCompletionHandler:^(NSError * _Nullable error) {
       if (error) NSLog(@"FDNotificationCenter addNotificationRequest error: %@", error);
