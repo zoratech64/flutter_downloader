@@ -1187,8 +1187,8 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
     if ([action isEqualToString:FDActionPause]) {
         [self pauseTaskWithId:taskId];
         // Show “Paused” card (Resume/Cancel) — DO NOT remove
-        double pct = [[self loadTaskWithId:taskId][@"progress"] doubleValue];
-        [self fd_updatePausedNotificationForTaskId:taskId progress:pct];
+        // double pct = [[self loadTaskWithId:taskId][@"progress"] doubleValue];
+        // [self fd_updatePausedNotificationForTaskId:taskId progress:pct];
     } else if ([action isEqualToString:FDActionResume]) {
         [self resumeTaskWithIdFromNotification:taskId];
         // Show “Downloading” card (Pause/Cancel) — DO NOT remove
@@ -1202,30 +1202,42 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
 }
 
 // Show a banner only once per task while the app is in foreground.
+// Show a banner only once per task; for later updates, update the *List* (no banner).
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
        willPresentNotification:(UNNotification *)notification
          withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler {
 
     NSString *taskId = notification.request.content.userInfo[@"taskId"];
-    if (taskId && [self.fd_didShowBannerForTask containsObject:taskId]) {
-        // Subsequent updates: no banner (the card still updates silently)
-        completionHandler(UNNotificationPresentationOptionNone);
-        return;
-    }
 
+    // First delivery for this taskId → Banner + List + Sound
+    BOOL isFirstForTask = YES;
     if (taskId) {
         @synchronized (self) {
-            [self.fd_didShowBannerForTask addObject:taskId];
+            isFirstForTask = ![self.fd_didShowBannerForTask containsObject:taskId];
+            if (isFirstForTask) {
+                [self.fd_didShowBannerForTask addObject:taskId];
+            }
         }
     }
 
     if (@available(iOS 14.0, *)) {
-        completionHandler(UNNotificationPresentationOptionBanner |
-                          UNNotificationPresentationOptionList |
-                          UNNotificationPresentationOptionSound);
+        if (isFirstForTask) {
+            completionHandler(UNNotificationPresentationOptionBanner |
+                              UNNotificationPresentationOptionList |
+                              UNNotificationPresentationOptionSound);
+        } else {
+            // 🔑 Subsequent updates: keep it in the Notification List (no banner, no sound)
+            completionHandler(UNNotificationPresentationOptionList);
+        }
     } else {
-        completionHandler(UNNotificationPresentationOptionAlert |
-                          UNNotificationPresentationOptionSound);
+        // iOS 13 and earlier
+        if (isFirstForTask) {
+            completionHandler(UNNotificationPresentationOptionAlert |
+                              UNNotificationPresentationOptionSound);
+        } else {
+            // On older iOS, there's no "List" option. Use Alert to ensure it stays visible.
+            completionHandler(UNNotificationPresentationOptionAlert);
+        }
     }
 }
 
