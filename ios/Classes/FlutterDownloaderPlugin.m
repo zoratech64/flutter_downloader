@@ -1199,4 +1199,32 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
     if (completionHandler) completionHandler();
 }
 
+// Show a banner only once per task while the app is in foreground.
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+       willPresentNotification:(UNNotification *)notification
+         withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler {
+
+    NSString *taskId = notification.request.content.userInfo[@"taskId"];
+    if (taskId && [self.fd_didShowBannerForTask containsObject:taskId]) {
+        // Subsequent updates: no banner (the card still updates silently)
+        completionHandler(UNNotificationPresentationOptionNone);
+        return;
+    }
+
+    if (taskId) {
+        @synchronized (self) {
+            [self.fd_didShowBannerForTask addObject:taskId];
+        }
+    }
+
+    if (@available(iOS 14.0, *)) {
+        completionHandler(UNNotificationPresentationOptionBanner |
+                          UNNotificationPresentationOptionList |
+                          UNNotificationPresentationOptionSound);
+    } else {
+        completionHandler(UNNotificationPresentationOptionAlert |
+                          UNNotificationPresentationOptionSound);
+    }
+}
+
 @end
