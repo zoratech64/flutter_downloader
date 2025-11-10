@@ -242,8 +242,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                 dispatch_async(self.databaseQueue, ^{
                     [weakSelf updateTask:taskId status:STATUS_PAUSED progress:progress resumable:YES];
                 });
-
-                [weakSelf fd_updatePausedNotificationForTaskId:taskId];
+                [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress];
                 return;
             }
         };
@@ -640,7 +639,8 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                         _runningTaskById[newTaskId] = newTask;
                         [_runningTaskById removeObjectForKey:taskId];
                     }
-                    
+                    double pct = [[weakSelf loadTaskWithId:newTaskId ?: taskId][@"progress"] doubleValue];
+                    [weakSelf fd_updateRunningNotificationForTaskId:(newTaskId ?: taskId) progress:pct];
                     [weakSelf updateTask:taskId newTaskId:newTaskId status:STATUS_RUNNING resumable:NO];
                     NSDictionary *updatedTask = [weakSelf loadTaskWithId:newTaskId];
                     NSNumber *progress = updatedTask[KEY_PROGRESS];
@@ -905,7 +905,12 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
             dispatch_async(self.databaseQueue, ^{
                 [weakSelf updateTask:taskId status:STATUS_RUNNING progress:progress];
             });
-            
+
+            double pct = (totalBytesExpectedToWrite > 0)
+            ? ((double)totalBytesWritten * 100.0 / (double)totalBytesExpectedToWrite)
+            : -1; // unknown size → textual “Downloading…” is fine
+            [self fd_updateRunningNotificationForTaskId:taskId progress:pct];
+
             // Throttle notifications (no banner spam). We always "update" the same card.
             NSTimeInterval now = [NSDate date].timeIntervalSince1970;
             NSMutableDictionary *t = [self fd_taskInfoForId:taskId];
@@ -1091,27 +1096,36 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                                                         body:@"Starting download…"
                                                     category:FDCategoryRunning
                                                     userInfo:@{ @"taskId": taskId }
-                                                    silent:YES];
+                                                    silent:NO];
     });
 }
 
-- (void)fd_updatePausedNotificationForTaskId:(NSString *)taskId {
-    __weak typeof(self) weakSelf = self;
-    dispatch_async(self.databaseQueue, ^{
-        NSDictionary* taskDict = [weakSelf loadTaskWithId:taskId];
-        if (taskDict) {
-            double pct = [taskDict[KEY_PROGRESS] doubleValue];
-            NSString *body = [NSString stringWithFormat:@"Paused — %.0f%%", pct];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
-                                                               title:[self fd_titleForTaskId:taskId]
-                                                                body:body
-                                                            category:FDCategoryPaused
-                                                            userInfo:@{ @"taskId": taskId }
-                                                            silent:YES];
-            });
-        }
-    });
+- (NSString *)fd_taskIdFromUserInfo:(NSDictionary *)info {
+  if (!info || (id)info == [NSNull null]) return nil;
+  NSString *tid = info[@"taskId"];
+  if (!tid || (id)tid == [NSNull null] || tid.length == 0) tid = info[@"task_id"];
+  return tid;
+}
+
+// Show “running” card with Pause/Cancel (silent update)
+- (void)fd_updateRunningNotificationForTaskId:(NSString *)taskId progress:(double)pct {
+  NSString *body = (pct >= 0) ? [NSString stringWithFormat:@"Downloading — %.0f%%", pct] : @"Downloading…";
+  [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                 title:[self fd_titleForTaskId:taskId]
+                                                  body:body
+                                              category:FDCategoryRunning
+                                              userInfo:@{ @"taskId": taskId }
+                                                silent:YES];
+}
+
+- (void)fd_updatePausedNotificationForTaskId:(NSString *)taskId progress:(double)pct {
+  NSString *body = (pct >= 0) ? [NSString stringWithFormat:@"Paused — %.0f%%", pct] : @"Paused";
+  [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                 title:[self fd_titleForTaskId:taskId]
+                                                  body:body
+                                              category:FDCategoryPaused
+                                              userInfo:@{ @"taskId": taskId }
+                                                silent:YES];
 }
 
 - (void)fd_postResumeNotificationForTaskId:(NSString *)taskId {
@@ -1157,62 +1171,31 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 #pragma mark - UNUserNotificationCenterDelegate (banner once + action handling)
 
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
-       willPresentNotification:(UNNotification *)notification
-         withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler {
-
-    NSString *taskId = notification.request.content.userInfo[@"taskId"];
-    if (taskId && [self.fd_didShowBannerForTask containsObject:taskId]) {
-        // Suppress banners/lists for subsequent updates; keep the card updated silently.
-        completionHandler(UNNotificationPresentationOptionNone);
-    } else {
-        if (taskId) {
-            @synchronized (self) {
-                [self.fd_didShowBannerForTask addObject:taskId];
-            }
-        }
-        if (@available(iOS 14.0, *)) {
-            completionHandler(UNNotificationPresentationOptionBanner |
-                              UNNotificationPresentationOptionList |
-                              UNNotificationPresentationOptionSound);
-        } else {
-            completionHandler(UNNotificationPresentationOptionAlert |
-                              UNNotificationPresentationOptionSound);
-        }
-    }
-}
-
-- (NSString *)fd_taskIdFromUserInfo:(NSDictionary *)info {
-  if (!info || (id)info == [NSNull null]) return nil;
-  NSString *tid = info[@"taskId"];
-  if (!tid || (id)tid == [NSNull null] || tid.length == 0) tid = info[@"task_id"];
-  return tid;
-}
-
-- (void)userNotificationCenter:(UNUserNotificationCenter *)center
 didReceiveNotificationResponse:(UNNotificationResponse *)response
          withCompletionHandler:(void (^)(void))completionHandler {
 
     NSDictionary *info = response.notification.request.content.userInfo;
-    // We set "taskId" in FDNotificationCenter.m
-    NSString *taskId = info[@"taskId"];
+    NSString *taskId = [self fd_taskIdFromUserInfo:info];
     NSString *action = response.actionIdentifier;
 
-    if (debug) {
-        NSLog(@"[FD] didReceiveNotificationResponse action=%@ taskId=%@", action, taskId);
-    }
+    if (debug) NSLog(@"[FD] didReceiveNotificationResponse action=%@ taskId=%@", action, taskId);
+
+    if (taskId.length == 0) { if (completionHandler) completionHandler(); return; }
 
     if ([action isEqualToString:FDActionPause]) {
         [self pauseTaskWithId:taskId];
-        [self fd_updatePausedNotificationForTaskId:taskId]; // keeps card, swaps to Resume/Cancel
+        // Show “Paused” card (Resume/Cancel) — DO NOT remove
+        double pct = [[self loadTaskWithId:taskId][@"progress"] doubleValue];
+        [self fd_updatePausedNotificationForTaskId:taskId progress:pct];
     } else if ([action isEqualToString:FDActionResume]) {
-        [self resumeTaskWithIdFromNotification:taskId];     // posts "Resuming…" silently
+        [self resumeTaskWithIdFromNotification:taskId];
+        // Show “Downloading” card (Pause/Cancel) — DO NOT remove
+        double pct = [[self loadTaskWithId:taskId][@"progress"] doubleValue];
+        [self fd_updateRunningNotificationForTaskId:taskId progress:pct];
     } else if ([action isEqualToString:FDActionCancel]) {
-        [self cancelTaskWithId:taskId];                     // removes this card
-        // (removeForTaskId is called in cancelTaskWithId)
-    } else {
-        // Tapping the body or FDActionOpen goes through your app/UI; nothing to do here.
+        // Only Cancel removes the card
+        [self cancelTaskWithId:taskId];
     }
-
     if (completionHandler) completionHandler();
 }
 

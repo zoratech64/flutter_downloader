@@ -26,19 +26,18 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
   UNNotificationCategory *paused  = [UNNotificationCategory categoryWithIdentifier:FDCategoryPaused  actions:@[resume, cancel] intentIdentifiers:@[] options:UNNotificationCategoryOptionCustomDismissAction];
   UNNotificationCategory *done    = [UNNotificationCategory categoryWithIdentifier:FDCategoryDone    actions:@[open]           intentIdentifiers:@[] options:UNNotificationCategoryOptionNone];
 
-  [[UNUserNotificationCenter currentNotificationCenter]
-    setNotificationCategories:[NSSet setWithObjects:running, paused, done, nil]];
+  [[UNUserNotificationCenter currentNotificationCenter] setNotificationCategories:[NSSet setWithObjects:running, paused, done, nil]];
 }
 
 - (void)ensureAuthorization:(void(^)(void))completion {
   UNUserNotificationCenter *c = [UNUserNotificationCenter currentNotificationCenter];
-  [c getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
+  [c getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings * _Nonnull settings) {
     if (settings.authorizationStatus == UNAuthorizationStatusAuthorized ||
         settings.authorizationStatus == UNAuthorizationStatusProvisional) {
       if (completion) completion();
     } else {
       [c requestAuthorizationWithOptions:(UNAuthorizationOptionAlert|UNAuthorizationOptionSound|UNAuthorizationOptionBadge)
-                       completionHandler:^(__unused BOOL granted, __unused NSError *error) {
+                       completionHandler:^(__unused BOOL granted, __unused NSError * _Nullable error) {
         if (completion) completion();
       }];
     }
@@ -62,12 +61,13 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
 
     UNMutableNotificationContent *content = [UNMutableNotificationContent new];
     content.title = title ?: @"Download";
-    content.body  = body  ?: @"";
+    content.body  = body ?: @"";
     if (!silent) content.sound = [UNNotificationSound defaultSound];
     content.categoryIdentifier = category;
     content.threadIdentifier = [NSString stringWithFormat:@"fd.download.%@", taskId];
 
     NSMutableDictionary *info = userInfo ? [userInfo mutableCopy] : [NSMutableDictionary new];
+    // Write BOTH keys so old/new paths work
     info[@"taskId"]  = taskId ?: @"";
     info[@"task_id"] = taskId ?: @"";
     content.userInfo = info;
@@ -77,6 +77,7 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
                                          : UNNotificationInterruptionLevelActive;
     }
 
+    // IMPORTANT: deliver immediately (no trigger) and DO NOT remove first.
     UNNotificationRequest *req =
       [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
 
