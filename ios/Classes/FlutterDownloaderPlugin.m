@@ -140,6 +140,8 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         // Become the UNUserNotificationCenter delegate here so we can suppress banners after the first one.
         UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
         center.delegate = self;
+        NSLog(@"[FD] delegate after init = %@",
+      NSStringFromClass(center.delegate.class));
     }
 
     return self;
@@ -783,6 +785,8 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
   // Set UNUserNotificationCenter delegate to this plugin instance,
   // so we can suppress banners for progress updates (banner shown only once).
   [UNUserNotificationCenter currentNotificationCenter].delegate = plugin;
+  NSLog(@"[FD] delegate after register = %@",
+      NSStringFromClass([UNUserNotificationCenter currentNotificationCenter].delegate.class));
   NSLog(@"[FD] UNUserNotificationCenter.delegate = %@",
       NSStringFromClass([UNUserNotificationCenter currentNotificationCenter].delegate.class));
 }
@@ -1175,6 +1179,11 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
 didReceiveNotificationResponse:(UNNotificationResponse *)response
          withCompletionHandler:(void (^)(void))completionHandler {
+
+    NSLog(@"[FD] ACTION tapped: %@  category=%@  userInfo=%@",
+      response.actionIdentifier,
+      response.notification.request.content.categoryIdentifier,
+      response.notification.request.content.userInfo);
 
     NSDictionary *info = response.notification.request.content.userInfo;
     NSString *taskId = [self fd_taskIdFromUserInfo:info];
