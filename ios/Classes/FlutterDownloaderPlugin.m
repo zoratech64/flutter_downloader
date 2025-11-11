@@ -215,8 +215,9 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
             if ([taskId isEqualToString:[weakSelf identifierForTask:download]] && (download.state == NSURLSessionTaskStateRunning)) {
                 NSDictionary *task = [weakSelf loadTaskWithId:taskId];
                 double progress = [task[@"progress"] doubleValue];
+
                 @synchronized (self) {
-                    [self.fd_pausingTaskIds addObject:taskId];
+                [self.fd_pausingTaskIds addObject:taskId];
                 }
 
                 [download cancelByProducingResumeData:^(NSData * _Nullable resumeData) {
@@ -231,20 +232,26 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                             NSLog(@"save partial downloaded data to a file: %s", success ? "success" : "failure");
                         }
                     }
+
+                    // Mark PAUSED in memory and DB
+                    @synchronized(self) {
+                        _runningTaskById[taskId][KEY_PROGRESS]  = @(progress);
+                        _runningTaskById[taskId][KEY_STATUS]    = @(STATUS_PAUSED);
+                        _runningTaskById[taskId][KEY_RESUMABLE] = @(YES);
+                    }
+
+                    [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_PAUSED) andProgress:@(progress)];
+
+                    dispatch_async(self.databaseQueue, ^{
+                        [weakSelf updateTask:taskId status:STATUS_PAUSED progress:progress resumable:YES];
+                    });
+
+                    // 🔑 Now that the OS has transitioned the task to cancelled (with resume data),
+                    // post the Paused card. A tiny delay further avoids replace/suppress races.
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress]; // FDCategoryPaused, silent:YES
+                    });
                 }];
-
-                @synchronized(self) {
-                    _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
-                    _runningTaskById[taskId][KEY_STATUS] = @(STATUS_PAUSED);
-                    _runningTaskById[taskId][KEY_RESUMABLE] = @(YES);
-                }
-
-                [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_PAUSED) andProgress:@(progress)];
-                
-                dispatch_async(self.databaseQueue, ^{
-                    [weakSelf updateTask:taskId status:STATUS_PAUSED progress:progress resumable:YES];
-                });
-                [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress];
                 return;
             }
         };
@@ -787,8 +794,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
   [UNUserNotificationCenter currentNotificationCenter].delegate = plugin;
   NSLog(@"[FD] delegate after register = %@",
       NSStringFromClass([UNUserNotificationCenter currentNotificationCenter].delegate.class));
-  NSLog(@"[FD] UNUserNotificationCenter.delegate = %@",
-      NSStringFromClass([UNUserNotificationCenter currentNotificationCenter].delegate.class));
 }
 
 + (void)setPluginRegistrantCallback:(FlutterPluginRegistrantCallback)callback {
@@ -976,6 +981,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                                                             category:FDCategoryDone
                                                             userInfo:@{ @"taskId": taskId }
                                                             silent:YES];
+                [[FDNotificationCenter shared] removeForTaskId:taskId];
             } else {
                 [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_FAILED) andProgress:@(-1)];
                 [weakSelf updateTask:taskId status:STATUS_FAILED progress:-1];
@@ -1201,8 +1207,8 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
     } else if ([action isEqualToString:FDActionResume]) {
         [self resumeTaskWithIdFromNotification:taskId];
         // Show “Downloading” card (Pause/Cancel) — DO NOT remove
-        double pct = [[self loadTaskWithId:taskId][@"progress"] doubleValue];
-        [self fd_updateRunningNotificationForTaskId:taskId progress:pct];
+        // double pct = [[self loadTaskWithId:taskId][@"progress"] doubleValue];
+        // [self fd_updateRunningNotificationForTaskId:taskId progress:pct];
     } else if ([action isEqualToString:FDActionCancel]) {
         // Only Cancel removes the card
         [self cancelTaskWithId:taskId];
