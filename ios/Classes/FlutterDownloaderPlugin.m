@@ -169,25 +169,34 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     return _session;
 }
 
-- (NSURLSessionDownloadTask*)downloadTaskWithURL: (NSURL*) url fileName: (NSString*) fileName andSavedDir: (NSString*) savedDir andHeaders: (NSString*) headers
+- (NSURLSessionDownloadTask*)downloadTaskWithURL:(NSURL*)url
+                                       fileName:(NSString*)fileName
+                                     andSavedDir:(NSString*)savedDir
+                                      andHeaders:(NSString*)headers
 {
     NSMutableURLRequest *request = [[NSMutableURLRequest alloc] initWithURL:url];
-    if (headers != nil && [headers length] > 0) {
-        NSError *jsonError;
+    if (headers != nil && headers.length > 0) {
         NSData *data = [headers dataUsingEncoding:NSUTF8StringEncoding];
+        NSError *jsonError = nil;
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:&jsonError];
-
         for (NSString *key in json) {
             NSString *value = json[key];
-            if (debug) {
-                NSLog(@"Header(%@: %@)", key, value);
-            }
+            if (debug) NSLog(@"Header(%@: %@)", key, value);
             [request setValue:value forHTTPHeaderField:key];
         }
     }
+
     NSURLSessionDownloadTask *task = [[self currentSession] downloadTaskWithRequest:request];
     task.taskDescription = [self createTaskId];
     [task resume];
+
+    // Clean any stale resume blob for this new task id
+    NSString *taskId = task.taskDescription;
+    NSURL *resumeURL = [self fd_resumeURLForTaskId:taskId];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:resumeURL.path]) {
+        [fm removeItemAtURL:resumeURL error:nil];
+    }
 
     return task;
 }
@@ -238,11 +247,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 
                     if (haveResumeData) {
                         NSFileManager *fm = [NSFileManager defaultManager];
-                        NSURL *resumeURL = [weakSelf fd_resumeDataURLForTaskId:taskId taskInfo:task downloadTask:download];
-
-                        // ensure dir exists
-                        [fm createDirectoryAtURL:[resumeURL URLByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
-
+                        NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
                         if ([fm fileExistsAtPath:resumeURL.path]) {
                             [fm removeItemAtURL:resumeURL error:nil];
                         }
@@ -299,13 +304,10 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     // Remove only this notification card
     [[FDNotificationCenter shared] removeForTaskId:taskId];
     dispatch_async(self.databaseQueue, ^{
-        NSDictionary *task = [weakSelf loadTaskWithId:taskId];
-        if (task) {
-            NSURL *resumeURL = [[weakSelf fileUrlFromDict:task] URLByAppendingPathExtension:@"resume"];
-            NSFileManager *fm = [NSFileManager defaultManager];
-            if ([fm fileExistsAtPath:resumeURL.path]) {
-                [fm removeItemAtURL:resumeURL error:nil];
-            }
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
+        if ([fm fileExistsAtPath:resumeURL.path]) {
+            [fm removeItemAtURL:resumeURL error:nil];
         }
     });
     // Also allow a fresh banner if same taskId is reused later (safety)
@@ -475,6 +477,22 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     NSString *query = @"DELETE FROM task WHERE task_id = ?";
     NSArray *values = @[taskId];
     [_dbManager executeQuery:query withParameters:values];
+}
+
+// Hidden resume store under Library/Caches/FDResume (not visible in Files)
+- (NSURL *)fd_resumeDir {
+    NSURL *caches = [[[NSFileManager defaultManager] URLsForDirectory:NSCachesDirectory
+                                                            inDomains:NSUserDomainMask] firstObject];
+    NSURL *dir = [caches URLByAppendingPathComponent:@"FDResume" isDirectory:YES];
+    [[NSFileManager defaultManager] createDirectoryAtURL:dir
+                            withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+// Save by taskId (independent of final filename)
+- (NSURL *)fd_resumeURLForTaskId:(NSString *)taskId {
+    return [[self fd_resumeDir] URLByAppendingPathComponent:
+            [[taskId stringByReplacingOccurrencesOfString:@"/" withString:@"_"] stringByAppendingPathExtension:@"resume"]];
 }
 
 - (NSArray*)loadAllTasks{
@@ -671,7 +689,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         if (taskDict != nil) {
             if ([taskDict[KEY_STATUS] intValue] == STATUS_PAUSED) {
                 NSURL *partialFileURL = [weakSelf fileUrlFromDict:taskDict];
-                NSURL *resumeURL = [weakSelf fd_resumeDataURLFromDict:taskDict];
+                NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
                 NSData *resumeData = [NSData dataWithContentsOfURL:resumeURL];
 
                 if (resumeData != nil) {
@@ -803,7 +821,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
             return;
         }
 
-        // If it's enqueued or running, cancel the active NSURLSession task first
+        // If it's enqueued or running, cancel the NSURLSession task first
         int status = [taskDict[KEY_STATUS] intValue];
         if (status == STATUS_ENQUEUED || status == STATUS_RUNNING) {
             if (debug) NSLog(@"[FD] remove: task %@ is %@, cancelling before removal",
@@ -811,34 +829,32 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
             [weakSelf cancelTaskWithId:taskId];
         }
 
-        // Paths for final file and sidecar resume data "<final>.resume"
+        // Final file (Documents/...) and resume sidecar (Caches/FDResume/taskId.resume)
         NSURL *finalURL  = [weakSelf fileUrlFromDict:taskDict];
-        NSURL *resumeURL = [finalURL URLByAppendingPathExtension:@"resume"];
+        NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
         NSFileManager *fm = [NSFileManager defaultManager];
 
-        // Optionally delete the downloaded content
-        if (shouldDeleteContent) {
-            if ([fm fileExistsAtPath:finalURL.path]) {
-                NSError *rmErr = nil;
-                [fm removeItemAtURL:finalURL error:&rmErr];
-                if (rmErr && debug) NSLog(@"[FD] remove: failed to delete file %@ -> %@", finalURL.path, rmErr);
-            }
+        // Optionally delete the completed/partial visible file
+        if (shouldDeleteContent && [fm fileExistsAtPath:finalURL.path]) {
+            NSError *rmErr = nil;
+            [fm removeItemAtURL:finalURL error:&rmErr];
+            if (rmErr && debug) NSLog(@"[FD] remove: failed to delete file %@ -> %@", finalURL.path, rmErr);
         }
 
-        // Always clean up the sidecar resume file if present
+        // Always delete the hidden resume blob in Caches
         if ([fm fileExistsAtPath:resumeURL.path]) {
             NSError *rmResumeErr = nil;
             [fm removeItemAtURL:resumeURL error:&rmResumeErr];
             if (rmResumeErr && debug) NSLog(@"[FD] remove: failed to delete resume %@ -> %@", resumeURL.path, rmResumeErr);
         }
 
-        // Remove the notification card (if any) for this task
+        // Remove the notification card (if any)
         [[FDNotificationCenter shared] removeForTaskId:taskId];
 
         // Delete the task record from DB
         [weakSelf deleteTask:taskId];
 
-        // Clear in-memory cache entry (if present)
+        // Clear in-memory cache entries
         @synchronized (self) {
             [_runningTaskById removeObjectForKey:taskId];
             [self.fd_didShowBannerForTask removeObject:taskId];
@@ -899,13 +915,18 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         NSDictionary* taskDict = [weakSelf loadTaskWithId:taskId];
         if (taskDict && [taskDict[KEY_STATUS] intValue] == STATUS_PAUSED) {
             NSURL *partialFileURL = [weakSelf fileUrlFromDict:taskDict];
-            NSURL *resumeURL = [weakSelf fd_resumeDataURLFromDict:taskDict];
+            NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
             NSData *resumeData = [NSData dataWithContentsOfURL:resumeURL];
             if (resumeData) {
                 NSURLSessionDownloadTask *task = [[weakSelf currentSession] downloadTaskWithResumeData:resumeData];
                 NSString *newTaskId = [weakSelf createTaskId];
                 task.taskDescription = newTaskId;
                 [task resume];
+
+                NSFileManager *fm = [NSFileManager defaultManager];
+                if ([fm fileExistsAtPath:resumeURL.path]) {
+                    [fm removeItemAtURL:resumeURL error:nil];
+                }
 
                 @synchronized(self) {
                     NSMutableDictionary *newTask = [NSMutableDictionary dictionaryWithDictionary:taskDict];
@@ -1016,69 +1037,101 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     }
 }
 
-- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didFinishDownloadingToURL:(NSURL *)location
+- (void)URLSession:(NSURLSession *)session
+  downloadTask:(NSURLSessionDownloadTask *)downloadTask
+  didFinishDownloadingToURL:(NSURL *)location
 {
     NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *) downloadTask.response;
     long httpStatusCode = [httpResponse statusCode];
     bool isSuccess = (httpStatusCode >= 200 && httpStatusCode < 300);
-    
-    if (isSuccess) {
-        NSString *taskId = [self identifierForTask:downloadTask ofSession:session];
-        
-        __weak typeof(self) weakSelf = self;
-        dispatch_async(self.databaseQueue, ^{
-            NSDictionary *task = [weakSelf loadTaskWithId:taskId];
-            NSURL *destinationURL = [weakSelf fileUrlOf:taskId taskInfo:task downloadTask:downloadTask];
-            
-            @synchronized(self) {
-                [_runningTaskById removeObjectForKey:taskId];
-            }
-            
-            NSFileManager *fileManager = [NSFileManager defaultManager];
-            NSURL *destinationDirectory = [destinationURL URLByDeletingLastPathComponent];
-            [fileManager createDirectoryAtURL:destinationDirectory withIntermediateDirectories:YES attributes:nil error:nil];
-            
-            if ([fileManager fileExistsAtPath:[destinationURL path]]) {
-                [fileManager removeItemAtURL:destinationURL error:nil];
-            }
-            
-            NSError *error;
-            BOOL success = [fileManager copyItemAtURL:location toURL:destinationURL error:&error];
-            
-            if (success) {
-                [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_COMPLETE) andProgress:@100];
-                [weakSelf updateTask:taskId status:STATUS_COMPLETE progress:100];
-                
-                [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
-                                                               title:[self fd_titleForTaskId:taskId]
-                                                                body:@"Download complete"
-                                                            category:FDCategoryDone
-                                                            userInfo:@{ @"taskId": taskId }
-                                                            silent:YES];
-                [[FDNotificationCenter shared] removeForTaskId:taskId];
-                // cleanup any leftover resume file
-                NSFileManager *fm = [NSFileManager defaultManager];
-                NSURL *resumeURL = [[weakSelf fileUrlOf:taskId taskInfo:task downloadTask:downloadTask] URLByAppendingPathExtension:@"resume"];
-                if ([fm fileExistsAtPath:resumeURL.path]) {
-                    [fm removeItemAtURL:resumeURL error:nil];
-                }
-            } else {
-                [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_FAILED) andProgress:@(-1)];
-                [weakSelf updateTask:taskId status:STATUS_FAILED progress:-1];
-                
-                [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
-                                                               title:[self fd_titleForTaskId:taskId]
-                                                                body:@"Download failed"
-                                                            category:FDCategoryDone
-                                                            userInfo:@{ @"taskId": taskId }
-                                                            silent:YES];
-            }
+    if (!isSuccess) {
+        // Non-2xx will be handled by didCompleteWithError:
+        return;
+    }
 
-            // Allow new banners for future tasks with same id if ever reused
-            @synchronized (self) {
-                [self.fd_didShowBannerForTask removeObject:taskId];
-            }
-        });
+    NSString *taskId = [self identifierForTask:downloadTask ofSession:session];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // 1) Compute destination paths synchronously
+    NSDictionary *task = [self loadTaskWithId:taskId]; // safe: small read
+    NSURL *destinationURL = [self fileUrlOf:taskId taskInfo:task downloadTask:downloadTask];
+    // 3) Success: clean up resume sidecar (if any), update DB, and finish UI
+    NSURL *resumeURL = [self fd_resumeURLForTaskId:taskId];
+    if ([fm fileExistsAtPath:resumeURL.path]) {
+        NSError *rmResumeErr = nil;
+        [fm removeItemAtURL:resumeURL error:&rmResumeErr];
+        if (rmResumeErr && debug) NSLog(@"[FD] cleanup resume file error %@ -> %@", resumeURL.path, rmResumeErr);
+    }
+
+    // Ensure destination dir exists
+    NSError *dirErr = nil;
+    [fm createDirectoryAtURL:[destinationURL URLByDeletingLastPathComponent]
+  withIntermediateDirectories:YES
+                   attributes:nil
+                        error:&dirErr];
+    if (dirErr && debug) {
+        NSLog(@"[FD] createDirectory error for %@ -> %@", destinationURL.URLByDeletingLastPathComponent.path, dirErr);
+    }
+
+    // If a stale final file exists, remove it
+    if ([fm fileExistsAtPath:destinationURL.path]) {
+        NSError *rmErr = nil;
+        [fm removeItemAtURL:destinationURL error:&rmErr];
+        if (rmErr && debug) NSLog(@"[FD] remove existing file error at %@ -> %@", destinationURL.path, rmErr);
+    }
+
+    // 2) Move first, fallback to copy — SYNCHRONOUSLY while 'location' is valid
+    NSError *moveErr = nil;
+    BOOL moved = [fm moveItemAtURL:location toURL:destinationURL error:&moveErr];
+    if (!moved) {
+        if (debug) NSLog(@"[FD] move failed %@ → %@ : %@", location.path, destinationURL.path, moveErr);
+        NSError *copyErr = nil;
+        BOOL copied = [fm copyItemAtURL:location toURL:destinationURL error:&copyErr];
+        if (!copied) {
+            if (debug) NSLog(@"[FD] copy failed %@ → %@ : %@", location.path, destinationURL.path, copyErr);
+
+            // Mark FAILED (source already gone)
+            [self sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_FAILED) andProgress:@(-1)];
+            dispatch_async(self.databaseQueue, ^{
+                [self updateTask:taskId status:STATUS_FAILED progress:-1];
+            });
+
+            [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                           title:[self fd_titleForTaskId:taskId]
+                                                            body:@"Download failed"
+                                                        category:FDCategoryDone
+                                                        userInfo:@{ @"taskId": taskId }
+                                                          silent:YES];
+            return;
+        }
+    }
+
+    // 3) Success: clean up resume sidecar (if any), update DB, and finish UI
+    if ([fm fileExistsAtPath:resumeURL.path]) {
+        NSError *rmResumeErr = nil;
+        [fm removeItemAtURL:resumeURL error:&rmResumeErr];
+        if (rmResumeErr && debug) NSLog(@"[FD] cleanup resume file error %@ -> %@", resumeURL.path, rmResumeErr);
+    }
+
+    @synchronized(self) { [_runningTaskById removeObjectForKey:taskId]; }
+
+    [self sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_COMPLETE) andProgress:@100];
+    dispatch_async(self.databaseQueue, ^{
+        [self updateTask:taskId status:STATUS_COMPLETE progress:100];
+    });
+
+    // Optional toast, then remove the card
+    [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
+                                                   title:[self fd_titleForTaskId:taskId]
+                                                    body:@"Download complete"
+                                                category:FDCategoryDone
+                                                userInfo:@{ @"taskId": taskId }
+                                                  silent:YES];
+    [[FDNotificationCenter shared] removeForTaskId:taskId];
+
+    // Reset banner-once memory for this task
+    @synchronized (self) {
+        [self.fd_didShowBannerForTask removeObject:taskId];
     }
 }
 
@@ -1197,15 +1250,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
   NSString *tid = info[@"taskId"];
   if (!tid || (id)tid == [NSNull null] || tid.length == 0) tid = info[@"task_id"];
   return tid;
-}
-
-- (NSURL *)fd_resumeDataURLForTaskId:(NSString *)taskId taskInfo:(NSDictionary *)task downloadTask:(NSURLSessionDownloadTask *)downloadTask {
-    NSURL *finalURL = [self fileUrlOf:taskId taskInfo:task downloadTask:downloadTask];
-    return [finalURL URLByAppendingPathExtension:@"resume"];
-}
-- (NSURL *)fd_resumeDataURLFromDict:(NSDictionary *)taskDict {
-    NSURL *finalURL = [self fileUrlFromDict:taskDict];
-    return [finalURL URLByAppendingPathExtension:@"resume"];
 }
 
 // Show “running” card with Pause/Cancel (silent update)
