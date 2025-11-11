@@ -236,52 +236,38 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                 [download cancelByProducingResumeData:^(NSData * _Nullable resumeData) {
                     BOOL haveResumeData = (resumeData != nil);
 
-                    // Persist resume data (if any) to the file we use for resuming.
                     if (haveResumeData) {
                         NSFileManager *fm = [NSFileManager defaultManager];
-                        NSURL *destinationURL = [weakSelf fileUrlOf:taskId taskInfo:task downloadTask:download];
-                        if ([fm fileExistsAtPath:destinationURL.path]) {
-                            [fm removeItemAtURL:destinationURL error:nil];
+                        NSURL *resumeURL = [weakSelf fd_resumeDataURLForTaskId:taskId taskInfo:task downloadTask:download];
+
+                        // ensure dir exists
+                        [fm createDirectoryAtURL:[resumeURL URLByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
+
+                        if ([fm fileExistsAtPath:resumeURL.path]) {
+                            [fm removeItemAtURL:resumeURL error:nil];
                         }
-                        BOOL saved = [resumeData writeToURL:destinationURL atomically:YES];
-                        if (debug) {
-                            NSLog(@"save partial downloaded data to a file: %s", saved ? "success" : "failure");
-                        }
+                        BOOL saved = [resumeData writeToURL:resumeURL atomically:YES];
+                        if (debug) NSLog(@"save resume data %@ : %s", resumeURL.path, saved ? "success" : "failure");
                     }
 
-                    // Update in-memory state.
                     @synchronized (self) {
                         _runningTaskById[taskId][KEY_PROGRESS]  = @(progress);
                         _runningTaskById[taskId][KEY_STATUS]    = @(STATUS_PAUSED);
                         _runningTaskById[taskId][KEY_RESUMABLE] = @(haveResumeData ? YES : NO);
                     }
 
-                    // Notify Dart isolate & DB.
-                    [weakSelf sendUpdateProgressForTaskId:taskId
-                                                 inStatus:@(STATUS_PAUSED)
-                                              andProgress:@(progress)];
-
+                    [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_PAUSED) andProgress:@(progress)];
                     dispatch_async(self.databaseQueue, ^{
-                        [weakSelf updateTask:taskId
-                                      status:STATUS_PAUSED
-                                    progress:progress
-                                   resumable:haveResumeData];
+                        [weakSelf updateTask:taskId status:STATUS_PAUSED progress:progress resumable:haveResumeData];
                     });
 
-                    // Post the Paused card AFTER the OS finishes its cancel transition.
-                    // Slight delay avoids the replace/suppress race on some iOS versions.
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{
-                        [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress]; // FDCategoryPaused, silent:YES
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress];
                     });
-
-                    // Stabilizer: re-post once more to ensure the card sticks in Notification Center.
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.50 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.50 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                         [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress];
                     });
                 }];
-
                 return;
             }
         }
@@ -312,6 +298,16 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     }];
     // Remove only this notification card
     [[FDNotificationCenter shared] removeForTaskId:taskId];
+    dispatch_async(self.databaseQueue, ^{
+        NSDictionary *task = [weakSelf loadTaskWithId:taskId];
+        if (task) {
+            NSURL *resumeURL = [[weakSelf fileUrlFromDict:task] URLByAppendingPathExtension:@"resume"];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if ([fm fileExistsAtPath:resumeURL.path]) {
+                [fm removeItemAtURL:resumeURL error:nil];
+            }
+        }
+    });
     // Also allow a fresh banner if same taskId is reused later (safety)
     @synchronized (self) {
         [self.fd_didShowBannerForTask removeObject:taskId];
@@ -675,13 +671,19 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         if (taskDict != nil) {
             if ([taskDict[KEY_STATUS] intValue] == STATUS_PAUSED) {
                 NSURL *partialFileURL = [weakSelf fileUrlFromDict:taskDict];
-                NSData *resumeData = [NSData dataWithContentsOfURL:partialFileURL];
+                NSURL *resumeURL = [weakSelf fd_resumeDataURLFromDict:taskDict];
+                NSData *resumeData = [NSData dataWithContentsOfURL:resumeURL];
 
                 if (resumeData != nil) {
                     NSURLSessionDownloadTask *task = [[weakSelf currentSession] downloadTaskWithResumeData:resumeData];
                     NSString *newTaskId = [weakSelf createTaskId];
                     task.taskDescription = newTaskId;
                     [task resume];
+
+                    NSFileManager *fm = [NSFileManager defaultManager];
+                    if ([fm fileExistsAtPath:resumeURL.path]) {
+                        [fm removeItemAtURL:resumeURL error:nil];
+                    }
 
                     @synchronized(self) {
                         NSMutableDictionary *newTask = [NSMutableDictionary dictionaryWithDictionary:taskDict];
@@ -793,30 +795,59 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     __typeof__(self) __weak weakSelf = self;
 
     dispatch_async(self.databaseQueue, ^{
-        NSDictionary* taskDict = [weakSelf loadTaskWithId:taskId];
-        if (taskDict != nil) {
-            int status = [taskDict[KEY_STATUS] intValue];
-            if (status == STATUS_ENQUEUED || status == STATUS_RUNNING) {
-                [weakSelf cancelTaskWithId:taskId];
-            }
-            
-            [weakSelf deleteTask:taskId];
-            
-            if (shouldDeleteContent) {
-                NSURL *destinationURL = [weakSelf fileUrlFromDict:taskDict];
-                NSFileManager *fileManager = [NSFileManager defaultManager];
-                if ([fileManager fileExistsAtPath:[destinationURL path]]) {
-                    [fileManager removeItemAtURL:destinationURL error:nil];
-                }
-            }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                result(nil);
-            });
-        } else {
+        NSDictionary *taskDict = [weakSelf loadTaskWithId:taskId];
+        if (!taskDict) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 result(ERROR_INVALID_TASK_ID);
             });
+            return;
         }
+
+        // If it's enqueued or running, cancel the active NSURLSession task first
+        int status = [taskDict[KEY_STATUS] intValue];
+        if (status == STATUS_ENQUEUED || status == STATUS_RUNNING) {
+            if (debug) NSLog(@"[FD] remove: task %@ is %@, cancelling before removal",
+                             taskId, (status == STATUS_RUNNING ? @"RUNNING" : @"ENQUEUED"));
+            [weakSelf cancelTaskWithId:taskId];
+        }
+
+        // Paths for final file and sidecar resume data "<final>.resume"
+        NSURL *finalURL  = [weakSelf fileUrlFromDict:taskDict];
+        NSURL *resumeURL = [finalURL URLByAppendingPathExtension:@"resume"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        // Optionally delete the downloaded content
+        if (shouldDeleteContent) {
+            if ([fm fileExistsAtPath:finalURL.path]) {
+                NSError *rmErr = nil;
+                [fm removeItemAtURL:finalURL error:&rmErr];
+                if (rmErr && debug) NSLog(@"[FD] remove: failed to delete file %@ -> %@", finalURL.path, rmErr);
+            }
+        }
+
+        // Always clean up the sidecar resume file if present
+        if ([fm fileExistsAtPath:resumeURL.path]) {
+            NSError *rmResumeErr = nil;
+            [fm removeItemAtURL:resumeURL error:&rmResumeErr];
+            if (rmResumeErr && debug) NSLog(@"[FD] remove: failed to delete resume %@ -> %@", resumeURL.path, rmResumeErr);
+        }
+
+        // Remove the notification card (if any) for this task
+        [[FDNotificationCenter shared] removeForTaskId:taskId];
+
+        // Delete the task record from DB
+        [weakSelf deleteTask:taskId];
+
+        // Clear in-memory cache entry (if present)
+        @synchronized (self) {
+            [_runningTaskById removeObjectForKey:taskId];
+            [self.fd_didShowBannerForTask removeObject:taskId];
+            [self.fd_pausingTaskIds removeObject:taskId];
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            result(nil);
+        });
     });
 }
 
@@ -868,7 +899,8 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         NSDictionary* taskDict = [weakSelf loadTaskWithId:taskId];
         if (taskDict && [taskDict[KEY_STATUS] intValue] == STATUS_PAUSED) {
             NSURL *partialFileURL = [weakSelf fileUrlFromDict:taskDict];
-            NSData *resumeData = [NSData dataWithContentsOfURL:partialFileURL];
+            NSURL *resumeURL = [weakSelf fd_resumeDataURLFromDict:taskDict];
+            NSData *resumeData = [NSData dataWithContentsOfURL:resumeURL];
             if (resumeData) {
                 NSURLSessionDownloadTask *task = [[weakSelf currentSession] downloadTaskWithResumeData:resumeData];
                 NSString *newTaskId = [weakSelf createTaskId];
@@ -1024,6 +1056,12 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                                                             userInfo:@{ @"taskId": taskId }
                                                             silent:YES];
                 [[FDNotificationCenter shared] removeForTaskId:taskId];
+                // cleanup any leftover resume file
+                NSFileManager *fm = [NSFileManager defaultManager];
+                NSURL *resumeURL = [[weakSelf fileUrlOf:taskId taskInfo:task downloadTask:downloadTask] URLByAppendingPathExtension:@"resume"];
+                if ([fm fileExistsAtPath:resumeURL.path]) {
+                    [fm removeItemAtURL:resumeURL error:nil];
+                }
             } else {
                 [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_FAILED) andProgress:@(-1)];
                 [weakSelf updateTask:taskId status:STATUS_FAILED progress:-1];
@@ -1159,6 +1197,15 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
   NSString *tid = info[@"taskId"];
   if (!tid || (id)tid == [NSNull null] || tid.length == 0) tid = info[@"task_id"];
   return tid;
+}
+
+- (NSURL *)fd_resumeDataURLForTaskId:(NSString *)taskId taskInfo:(NSDictionary *)task downloadTask:(NSURLSessionDownloadTask *)downloadTask {
+    NSURL *finalURL = [self fileUrlOf:taskId taskInfo:task downloadTask:downloadTask];
+    return [finalURL URLByAppendingPathExtension:@"resume"];
+}
+- (NSURL *)fd_resumeDataURLFromDict:(NSDictionary *)taskDict {
+    NSURL *finalURL = [self fileUrlFromDict:taskDict];
+    return [finalURL URLByAppendingPathExtension:@"resume"];
 }
 
 // Show “running” card with Pause/Cancel (silent update)
