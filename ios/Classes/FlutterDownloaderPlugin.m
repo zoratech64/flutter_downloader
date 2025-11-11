@@ -204,57 +204,84 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     return task.taskDescription;
 }
 
-- (void)pauseTaskWithId: (NSString*)taskId
+- (void)pauseTaskWithId:(NSString*)taskId
 {
     if (debug) {
         NSLog(@"pause task with id: %@", taskId);
     }
     __typeof__(self) __weak weakSelf = self;
-    [[self currentSession] getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data, NSArray<NSURLSessionUploadTask *> *uploads, NSArray<NSURLSessionDownloadTask *> *downloads) {
+
+    [[self currentSession] getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data,
+                                                           NSArray<NSURLSessionUploadTask *> *uploads,
+                                                           NSArray<NSURLSessionDownloadTask *> *downloads) {
         for (NSURLSessionDownloadTask *download in downloads) {
-            if ([taskId isEqualToString:[weakSelf identifierForTask:download]] && (download.state == NSURLSessionTaskStateRunning)) {
+            if ([taskId isEqualToString:[weakSelf identifierForTask:download]] &&
+                (download.state == NSURLSessionTaskStateRunning)) {
+
                 NSDictionary *task = [weakSelf loadTaskWithId:taskId];
                 double progress = [task[@"progress"] doubleValue];
 
+                // Mark this pause as intentional so didCompleteWithError(NSURLErrorCancelled) is ignored.
                 @synchronized (self) {
-                [self.fd_pausingTaskIds addObject:taskId];
+                    [self.fd_pausingTaskIds addObject:taskId];
                 }
 
                 [download cancelByProducingResumeData:^(NSData * _Nullable resumeData) {
-                    if (resumeData) {
-                        NSFileManager *fileManager = [NSFileManager defaultManager];
+                    BOOL haveResumeData = (resumeData != nil);
+
+                    // Persist resume data (if any) to the file we use for resuming.
+                    if (haveResumeData) {
+                        NSFileManager *fm = [NSFileManager defaultManager];
                         NSURL *destinationURL = [weakSelf fileUrlOf:taskId taskInfo:task downloadTask:download];
-                        if ([fileManager fileExistsAtPath:[destinationURL path]]) {
-                            [fileManager removeItemAtURL:destinationURL error:nil];
+                        if ([fm fileExistsAtPath:destinationURL.path]) {
+                            [fm removeItemAtURL:destinationURL error:nil];
                         }
-                        BOOL success = [resumeData writeToURL:destinationURL atomically:YES];
+                        BOOL saved = [resumeData writeToURL:destinationURL atomically:YES];
                         if (debug) {
-                            NSLog(@"save partial downloaded data to a file: %s", success ? "success" : "failure");
+                            NSLog(@"save partial downloaded data to a file: %s", saved ? "success" : "failure");
                         }
                     }
 
-                    // Mark PAUSED in memory and DB
-                    @synchronized(self) {
+                    // Update in-memory state.
+                    @synchronized (self) {
                         _runningTaskById[taskId][KEY_PROGRESS]  = @(progress);
                         _runningTaskById[taskId][KEY_STATUS]    = @(STATUS_PAUSED);
-                        _runningTaskById[taskId][KEY_RESUMABLE] = @(YES);
+                        _runningTaskById[taskId][KEY_RESUMABLE] = @(haveResumeData ? YES : NO);
                     }
 
-                    [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_PAUSED) andProgress:@(progress)];
+                    // Notify Dart isolate & DB.
+                    [weakSelf sendUpdateProgressForTaskId:taskId
+                                                 inStatus:@(STATUS_PAUSED)
+                                              andProgress:@(progress)];
 
                     dispatch_async(self.databaseQueue, ^{
-                        [weakSelf updateTask:taskId status:STATUS_PAUSED progress:progress resumable:YES];
+                        [weakSelf updateTask:taskId
+                                      status:STATUS_PAUSED
+                                    progress:progress
+                                   resumable:haveResumeData];
                     });
 
-                    // 🔑 Now that the OS has transitioned the task to cancelled (with resume data),
-                    // post the Paused card. A tiny delay further avoids replace/suppress races.
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    // Post the Paused card AFTER the OS finishes its cancel transition.
+                    // Slight delay avoids the replace/suppress race on some iOS versions.
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
                         [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress]; // FDCategoryPaused, silent:YES
                     });
+
+                    // Stabilizer: re-post once more to ensure the card sticks in Notification Center.
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.50 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress];
+                    });
                 }];
+
                 return;
             }
-        };
+        }
+
+        // (Optional) If no running task matched, do nothing here.
+        // You could log for diagnosis:
+        if (debug) NSLog(@"[FD] pauseTaskWithId: no running task matched %@", taskId);
     }];
 }
 
