@@ -52,6 +52,9 @@
 
 @end
 
+// Tag to detect re-entrancy on the DB queue
+static const void *kFDDBQueueKey = &kFDDBQueueKey;
+
 @implementation FlutterDownloaderPlugin
 
 static FlutterPluginRegistrantCallback registerPlugins = nil;
@@ -103,7 +106,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
             NSLog(@"database path: %@", dbPath);
         }
         databaseQueue = dispatch_queue_create("vn.hunghd.flutter_downloader", 0);
-        
+        dispatch_queue_set_specific(databaseQueue, kFDDBQueueKey, (void *)kFDDBQueueKey, NULL);
         _dbManager = [[FlutterDownloaderDBManager alloc] initWithDatabaseFilePath:dbPath];
         
         if (_runningTaskById == nil) {
@@ -202,6 +205,10 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 - (NSString*)identifierForTask:(NSURLSessionTask*) task ofSession:(NSURLSession *)session
 {
     return task.taskDescription;
+}
+
+- (BOOL)fd_isOnDatabaseQueue {
+  return dispatch_get_specific(kFDDBQueueKey) != NULL;
 }
 
 - (void)pauseTaskWithId:(NSString*)taskId
@@ -346,9 +353,17 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 }
 
 - (void)executeDbWorkSynchronously:(void (^)(void))task {
+    if (self.isDatabaseQueueTerminated || task == nil) return;
+
+    // If we're already on the DB queue, run inline to avoid deadlock
+    if ([self fd_isOnDatabaseQueue]) {
+        task();
+        return;
+    }
+
     dispatch_sync(databaseQueue, ^{
         if (self.isDatabaseQueueTerminated) return;
-        if (task) task();
+        task();
     });
 }
 
@@ -1193,17 +1208,22 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
       task = _runningTaskById[taskId];
     }
     if (!task) {
-      [self executeDbWorkSynchronously:^{
-         task = [self loadTaskWithId:taskId];
-      }];
+      if ([self fd_isOnDatabaseQueue]) {
+        // Already on DB queue: call directly (no sync)
+        task = [self loadTaskWithId:taskId];
+      } else {
+        [self executeDbWorkSynchronously:^{
+            task = [self loadTaskWithId:taskId];
+        }];
+      }
     }
-    
+
     NSString *name = task[KEY_FILE_NAME];
-    if (name && ![name isEqual:[NSNull null]] && [name length] > 0) return name;
-    
+    if (name && ![name isEqual:[NSNull null]] && name.length > 0) return name;
+
     NSString *url = task[KEY_URL];
     if (url && ![url isEqual:[NSNull null]] && url.length > 0) return url.lastPathComponent ?: url;
-    
+
     return @"Download";
 }
 
