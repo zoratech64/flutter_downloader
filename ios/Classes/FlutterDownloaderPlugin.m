@@ -283,33 +283,40 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     }];
 }
 
-- (void)cancelTaskWithId:(NSString*)taskId
+- (void)cancelTaskWithId:(NSString *)taskId
 {
     if (debug) {
-        NSLog(@"cancel task with id: %@", taskId);
+        NSLog(@"[FD] cancelTaskWithId: %@", taskId);
     }
-    __weak typeof(self) weakSelf = this;
+    __weak typeof(self) weakSelf = self;
 
     [[self currentSession] getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data,
                                                            NSArray<NSURLSessionUploadTask *> *uploads,
-                                                           NSArray<NSURLSessionDownloadTask *> *downloads) {
+                                                           NSArray<NSURLSessionDownloadTask *> *downloads)
+    {
         BOOL matched = NO;
 
         for (NSURLSessionDownloadTask *download in downloads) {
             NSString *currentId = [weakSelf identifierForTask:download];
-            if (![taskId.equals:currentId]) { continue; }
+            if (![currentId isEqualToString:taskId]) {
+                continue;
+            }
             matched = YES;
 
-            // Cancel unless it's already completed/canceling
+            // Cancel for any state except "completed" or "already canceling".
             if (download.state != NSURLSessionTaskStateCompleted &&
                 download.state != NSURLSessionTaskStateCanceling) {
+                if (debug) {
+                    NSLog(@"[FD] cancelTaskWithId: matched %@ in state %ld → calling -cancel", taskId, (long)download.state);
+                }
                 [download cancel];
+            } else if (debug) {
+                NSLog(@"[FD] cancelTaskWithId: matched %@ but state=%ld (no-op)", taskId, (long)download.state);
             }
-            break;
+            break; // we found our taskId
         }
 
-        // Unconditionally flip local/DB/UI to CANCELED so the user sees it immediately,
-        // even if the system delivers the didCompleteWithError a bit later.
+        // Regardless of whether we caught it in-flight, flip local/DB/UI to CANCELED now
         @synchronized (self) {
             [_runningTaskById removeObjectForKey:taskId];
             [self.fd_pausingTaskIds removeObject:taskId];
@@ -319,14 +326,13 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         [weakSelf sendUpdateProgressForTaskId:taskId
                                      inStatus:@(STATUS_CANCELED)
                                   andProgress:@(-1)];
-
         dispatch_async(self.databaseQueue, ^{
             [weakSelf updateTask:taskId status:STATUS_CANCELED progress:-1];
         });
 
         [[FDNotificationCenter shared] removeForTaskId:taskId];
 
-        // Remove any hidden resume blob in Caches/FDResume so a later resume doesn’t restart.
+        // Clean up any hidden resume data
         NSFileManager *fm = [NSFileManager defaultManager];
         NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
         if ([fm fileExistsAtPath:resumeURL.path]) {
@@ -334,28 +340,59 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         }
 
         if (debug) {
-            NSLog(@"[FD] cancelTaskWithId:%@ matched=%@ (status->CANCELED, UI cleared)", taskId, matched ? @"YES" : @"NO");
+            NSLog(@"[FD] cancelTaskWithId: %@ done (matched=%@)", taskId, matched ? @"YES" : "NO");
         }
     }];
 }
 
-- (void)cancelAllTasks {
-    __typeof__(self) __weak weakSelf = self;
-    [[self currentSession] getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data, NSArray<NSURLSessionUploadTask *> *uploads, NSArray<NSURLSessionDownloadTask *> *downloads) {
+- (void)cancelAllTasks
+{
+    if (debug) {
+        NSLog(@"[FD] cancelAllTasks");
+    }
+    __weak typeof(self) weakSelf = self;
+
+    [[self.currentSession class] == [NSURLSession class] ? self.currentSession : self.currentSession /* just to placate static analyzers */ 
+     getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data,
+                                     NSArray<NSURLSessionUploadTask *> *uploads,
+                                     NSArray<NSURLSessionDownloadTask *> *downloads)
+    {
+        NSMutableArray<NSString *> *idsToCancel = [NSMutableArray arrayWithCapacity:downloads.count];
+
         for (NSURLSessionDownloadTask *download in downloads) {
-            if (download.state == NSURLSessionTaskStateRunning) {
+            NSString *tid = [weakSelf identifierForTask:download];
+            if (download.state != NSURLSessionTaskStateCompleted &&
+                download.state != NSURLSessionTaskStateCanceling) {
                 [download cancel];
-                NSString *taskId = [weakSelf identifierForTask:download];
-                [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_CANCELED) andProgress:@(-1)];
-                dispatch_async(self.databaseQueue, ^{
-                    [weakSelf updateTask:taskId status:STATUS_CANCELED progress:-1];
-                });
-                [[FDNotificationCenter shared] removeForTaskId:taskId];
-                @synchronized (self) {
-                    [self.fd_didShowBannerForTask removeObject:taskId];
-                }
             }
-        };
+            if (tid) { [idsToCancel addObject:tid]; }
+        }
+
+        // Flip local/DB/UI for all matched tasks
+        @synchronized (self) {
+            for (NSString *tid in idsToCancel) {
+                [_runningTaskById removeObjectForKey:tid];
+                [self.fd_pausingTaskIds removeObject:tid];
+                [self.fd_didShowBannerForTask removeObject:tid];
+            }
+        }
+
+        for (NSString *tid in idsToCancel) {
+            [weakSelf sendUpdateProgressForTaskId:tid inStatus:@(STATUS_CANCELED) andProgress:@(-1)];
+            dispatch_async(self.databaseQueue, ^{
+                [weakSelf updateTask:tid status:STATUS_CANCELED progress:-1];
+            });
+            [[FDNotificationCenter shared] removeForTaskId:tid];
+
+            NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:tid];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:resumeURL.path]) {
+                [[NSFileManager defaultManager] removeItemAtURL:resumeURL error:nil];
+            }
+        }
+
+        if (debug) {
+            NSLog(@"[FD] cancelAllTasks: canceled %lu tasks", (unsigned long)idsToCancel.count);
+        }
     }];
 }
 
