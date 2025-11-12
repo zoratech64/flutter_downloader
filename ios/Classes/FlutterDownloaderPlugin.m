@@ -286,13 +286,13 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 - (void)cancelTaskWithId:(NSString *)taskId
 {
     if (debug) {
-        NSLog(@"[FD] cancelTaskWithId: %@", taskId);
+        NSLog(@"[FD] cancel task with id: %@", taskId);
     }
     __weak typeof(self) weakSelf = self;
 
-    [[self currentSession] getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data,
-                                                           NSArray<NSURLSessionUploadTask *> *uploads,
-                                                           NSArray<NSURLSessionDownloadTask *> *downloads)
+    [self.currentSession getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data,
+                                                         NSArray<NSURLSessionUploadTask *> *uploads,
+                                                         NSArray<NSURLSessionDownloadTask *> *downloads)
     {
         BOOL matched = NO;
 
@@ -302,21 +302,20 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                 continue;
             }
             matched = YES;
-
-            // Cancel for any state except "completed" or "already canceling".
+            // Cancel for any state except completed/canceling
             if (download.state != NSURLSessionTaskStateCompleted &&
                 download.state != NSURLSessionTaskStateCanceling) {
                 if (debug) {
-                    NSLog(@"[FD] cancelTaskWithId: matched %@ in state %ld → calling -cancel", taskId, (long)download.state);
+                    NSLog(@"[FD] cancelTaskWithId:%@ matched state=%ld → calling -cancel", taskId, (long)download.state);
                 }
                 [download cancel];
             } else if (debug) {
-                NSLog(@"[FD] cancelTaskWithId: matched %@ but state=%ld (no-op)", taskId, (long)download.state);
+                NSLog(@"[FD] cancelTaskWithId:%@ already state=%ld (no-op)", taskId, (long)download.state);
             }
-            break; // we found our taskId
+            break; // found our task
         }
 
-        // Regardless of whether we caught it in-flight, flip local/DB/UI to CANCELED now
+        // Flip local/DB/UI to CANCELED *regardless* so user sees immediate effect.
         @synchronized (self) {
             [_runningTaskById removeObjectForKey:taskId];
             [self.fd_pausingTaskIds removeObject:taskId];
@@ -332,7 +331,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 
         [[FDNotificationCenter shared] removeForTaskId:taskId];
 
-        // Clean up any hidden resume data
+        // Remove any hidden resume blob so it can’t be resumed accidentally.
         NSFileManager *fm = [NSFileManager defaultManager];
         NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
         if ([fm fileExistsAtPath:resumeURL.path]) {
@@ -340,7 +339,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         }
 
         if (debug) {
-            NSLog(@"[FD] cancelTaskWithId: %@ done (matched=%@)", taskId, matched ? @"YES" : "NO");
+            NSLog(@"[FD] cancelTaskWithId:%@ → matched=%@", taskId, (matched ? @"YES" : @"NO"));
         }
     }];
 }
