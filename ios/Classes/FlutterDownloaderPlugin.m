@@ -283,37 +283,68 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     }];
 }
 
-- (void)cancelTaskWithId: (NSString*)taskId
+- (void)cancelTaskWithId:(NSString*)taskId
 {
     if (debug) {
         NSLog(@"cancel task with id: %@", taskId);
     }
+
     __typeof__(self) __weak weakSelf = self;
-    [[self currentSession] getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data, NSArray<NSURLSessionUploadTask *> *uploads, NSArray<NSURLSessionDownloadTask *> *downloads) {
+
+    [[self currentSession] getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data,
+                                                           NSArray<NSURLSessionUploadTask *> *uploads,
+                                                           NSArray<NSURLSessionDownloadTask *> *downloads) {
+        BOOL matched = NO;
+
         for (NSURLSessionDownloadTask *download in downloads) {
-            if ([taskId isEqualToString:[weakSelf identifierForTask:download]] && (download.state == NSURLSessionTaskStateRunning)) {
+            NSString *currentId = [weakSelf identifierForTask:download];
+            if (![taskId isEqualToString:currentId]) continue;
+
+            matched = YES;
+
+            // Cancel for any state other than completed/canceling
+            if (download.state != NSURLSessionTaskStateCompleted &&
+                download.state != NSURLSessionTaskStateCanceling) {
                 [download cancel];
-                [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_CANCELED) andProgress:@(-1)];
-                dispatch_async(self.databaseQueue, ^{
-                    [weakSelf updateTask:taskId status:STATUS_CANCELED progress:-1];
-                });
-                return;
             }
-        };
-    }];
-    // Remove only this notification card
-    [[FDNotificationCenter shared] removeForTaskId:taskId];
-    dispatch_async(self.databaseQueue, ^{
+
+            break;
+        }
+
+        // Whether we matched an in-flight task or not (e.g., paused/enqueued),
+        // force the local state to CANCELED so the UI/DB reflect the user's action.
+        @synchronized (self) {
+            [_runningTaskById removeObjectForKey:taskId];
+        }
+
+        [weakSelf sendUpdateProgressForTaskId:taskId
+                                     inStatus:@(STATUS_CANCELED)
+                                  andProgress:@(-1)];
+
+        dispatch_async(self.databaseQueue, ^{
+            [weakSelf updateTask:taskId status:STATUS_CANCELED progress:-1];
+        });
+
+        // Remove the notification card
+        [[FDNotificationCenter shared] removeForTaskId:taskId];
+
+        // Remove any hidden resume blob in Caches/FDResume
         NSFileManager *fm = [NSFileManager defaultManager];
         NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
         if ([fm fileExistsAtPath:resumeURL.path]) {
             [fm removeItemAtURL:resumeURL error:nil];
         }
-    });
-    // Also allow a fresh banner if same taskId is reused later (safety)
-    @synchronized (self) {
-        [self.fd_didShowBannerForTask removeObject:taskId];
-    }
+
+        // Let a future reuse of the same id banner again
+        @synchronized (self) {
+            [self.fd_didShowBannerForTask removeObject:taskId];
+            [self.fd_pausingTaskIds removeObject:taskId];
+        }
+
+        if (debug) {
+            NSLog(@"[FD] cancelTaskWithId: %@ -> matched=%@ (state updated to CANCELED)", taskId, matched ? @"YES" : @"NO");
+        }
+    }];
 }
 
 - (void)cancelAllTasks {
