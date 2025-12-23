@@ -47,16 +47,8 @@ class DownloadItems {
           'http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4',
     ),
     DownloadItem(
-      name: 'Ciao Alberto 480p',
-      url: 'https://cdn.movie.af/videos/Ciao-Alberto-2021-480p-Movie.af.mp4',
-    ),
-    DownloadItem(
-      name: 'Ciao Alberto 720p',
-      url: 'https://cdn.movie.af/videos/Ciao-Alberto-2021-720p-Movie.af.mp4',
-    ),
-    DownloadItem(
-      name: 'Ciao Alberto 1080p',
-      url: 'https://cdn.movie.af/videos/Ciao-Alberto-2021-1080p-Movie.af.mp4',
+      name: 'The-Sixth-Robber 360p',
+      url: 'https://cdn.movie.af/videos/6042/The-Sixth-Robber-2025-360p-Movie.af.mp4',
     ),
   ];
 
