@@ -408,39 +408,31 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
         }
 
         if (shouldDeleteContent) {
-        // choose the right folder
-        val filename = task.filename
-            ?: task.url.substringAfterLast("/")
-        val tempFile = if (task.saveInPublicStorage) {
-            // public Downloads directory
-            val dl = Environment.getExternalStoragePublicDirectory(
-                Environment.DIRECTORY_DOWNLOADS
+            val filename = task.filename ?: task.url.substringAfterLast("/")
+
+            // 1️⃣ Delete from public Downloads (MediaStore + raw)
+            val publicFile = File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                filename
             )
-            File(dl, filename)
-        } else {
-            // app‑specific folder (what you had before)
-            File(task.savedDir, filename)
+
+            Log.d(TAG, "→ remove(): public file = ${publicFile.absolutePath}")
+
+            deleteFileInMediaStore(publicFile)
+            if (publicFile.exists()) {
+                publicFile.delete()
+            }
+
+            // 2️⃣ Delete from app-specific storage
+            val appFile = File(task.savedDir, filename)
+            Log.d(TAG, "→ remove(): app file = ${appFile.absolutePath}")
+
+            if (appFile.exists()) {
+                val ok = appFile.delete()
+                Log.d(TAG, "→ remove(): app file deleted = $ok")
+            }
         }
 
-        Log.d(TAG, "→ remove(): target for deletion = ${tempFile.absolutePath} (exists=${tempFile.exists()})")
-
-        // 1) MediaStore delete
-        val deletedViaMediaStore = try {
-            deleteFileInMediaStore(tempFile)
-        } catch (e: Exception) {
-            Log.e(TAG, "MediaStore delete threw", e)
-            false
-        }
-        Log.d(TAG, "→ remove(): MediaStore.delete returned $deletedViaMediaStore")
-
-        // 2) Fallback raw delete
-        if (tempFile.exists()) {
-            val rawOk = tempFile.delete()
-            Log.d(TAG, "→ remove(): File.delete() returned $rawOk")
-        } else {
-            Log.d(TAG, "→ remove(): file no longer exists after MediaStore step")
-        }
-    }
 
         taskDao!!.deleteTask(taskId)
         NotificationManagerCompat.from(requireContext()).cancel(task.primaryId)
