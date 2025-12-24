@@ -321,7 +321,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 isResume,
                 timeout
             )
-            cleanUp()
+             cleanUp()
             dbHelper = null
             taskDao = null
             Result.success()
@@ -696,24 +696,38 @@ val savedFilePath = savedFile.path
                 DownloadStatus.COMPLETE
             }
 
-            if (finalStatus == DownloadStatus.COMPLETE) {
-                // Only now move into MediaStore if needed (Android Q+ + saveInPublicStorage)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && saveInPublicStorage) {
-    val uri = createFileInPublicDownloadsDir(actualFilename, contentType)
-    if (uri != null) {
-        // copy and delete original...
-        context.contentResolver.openOutputStream(uri, "w")?.use { dest ->
-            File(savedFilePath).inputStream().use { src -> src.copyTo(dest) }
-        }
-        File(savedFilePath).delete()
+            if (finalStatus == DownloadStatus.COMPLETE &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                saveInPublicStorage
+            ) {
+                try {
+                    // 1️⃣ Check if already exists (avoid duplicates)
+                    val existingUri = findExistingDownloadUri(actualFilename!!)
+                    if (existingUri != null) {
+                        log("Public download already exists, skipping copy")
+                        return
+                    }
 
-        // NEW: point the task to the public Downloads directory
-        val publicDownloadsDir = Environment
-            .getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            .absolutePath
-        taskDao?.updateTaskSavedDir(id.toString(), publicDownloadsDir)
-    }
-}
+                    // 2️⃣ Create MediaStore entry
+                    val uri = createFileInPublicDownloadsDir(actualFilename, contentType)
+                    if (uri != null) {
+                        // 3️⃣ COPY (never move)
+                        applicationContext.contentResolver
+                            .openOutputStream(uri, "w")
+                            ?.use { dest ->
+                                File(savedFilePath).inputStream().use { src ->
+                                    src.copyTo(dest)
+                                }
+                            }
+
+                        Thread.sleep(3000)
+                        log("After copy, app file exists = ${File(savedFilePath).exists()}")
+
+                        log("Copied file to public Downloads: $actualFilename")
+                    }
+                } catch (e: Exception) {
+                    logError("Failed copying to Downloads: ${e.message}")
+                }
             }
 
             val storage: Int = ContextCompat.checkSelfPermission(
