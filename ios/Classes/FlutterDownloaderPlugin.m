@@ -67,6 +67,7 @@ static int _step = 10;
 static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = nil;
 
 @synthesize databaseQueue;
+@synthesize currentSession = _session;
 
 static FlutterDownloaderPlugin *_sharedInstance = nil;
 + (instancetype)sharedInstance { return _sharedInstance; }
