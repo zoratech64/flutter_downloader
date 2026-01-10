@@ -6,8 +6,6 @@
 
 @property (nonatomic, copy) void (^backgroundTransferCompletionHandler)(void);
 
-@property (nonatomic, strong, readwrite) NSURLSession *currentSession;
-
 + (instancetype)sharedInstance;
 
 + (void)handleNotificationActionPause:(NSString *)taskId;
