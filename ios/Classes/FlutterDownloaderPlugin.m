@@ -225,19 +225,24 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     if (debug) {
         NSLog(@"pause task with id: %@", taskId);
     }
+
     __typeof__(self) __weak weakSelf = self;
 
     [[self currentSession] getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data,
-                                                           NSArray<NSURLSessionUploadTask *> *uploads,
-                                                           NSArray<NSURLSessionDownloadTask *> *downloads) {
+                                                          NSArray<NSURLSessionUploadTask *> *uploads,
+                                                          NSArray<NSURLSessionDownloadTask *> *downloads) {
+
+        BOOL matched = NO;
+
         for (NSURLSessionDownloadTask *download in downloads) {
             if ([taskId isEqualToString:[weakSelf identifierForTask:download]] &&
                 (download.state == NSURLSessionTaskStateRunning)) {
 
+                matched = YES;   // ← Add this flag
+
                 NSDictionary *task = [weakSelf loadTaskWithId:taskId];
                 double progress = [task[@"progress"] doubleValue];
 
-                // Mark this pause as intentional so didCompleteWithError(NSURLErrorCancelled) is ignored.
                 @synchronized (self) {
                     [self.fd_pausingTaskIds addObject:taskId];
                 }
@@ -256,12 +261,13 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                     }
 
                     @synchronized (self) {
-                        _runningTaskById[taskId][KEY_PROGRESS]  = @(progress);
-                        _runningTaskById[taskId][KEY_STATUS]    = @(STATUS_PAUSED);
+                        _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
+                        _runningTaskById[taskId][KEY_STATUS] = @(STATUS_PAUSED);
                         _runningTaskById[taskId][KEY_RESUMABLE] = @(haveResumeData ? YES : NO);
                     }
 
                     [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_PAUSED) andProgress:@(progress)];
+
                     dispatch_async(self.databaseQueue, ^{
                         [weakSelf updateTask:taskId status:STATUS_PAUSED progress:progress resumable:haveResumeData];
                     });
@@ -273,13 +279,44 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                         [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress];
                     });
                 }];
-                return;
+
+                return;   // ← We found and handled it → early exit
             }
         }
+        if (!matched) {
+            if (debug) {
+                NSLog(@"[FD] pauseTaskWithId: no running task matched for %@ → forcing pause via DB", taskId);
+            }
 
-        // (Optional) If no running task matched, do nothing here.
-        // You could log for diagnosis:
-        if (debug) NSLog(@"[FD] pauseTaskWithId: no running task matched %@", taskId);
+            NSDictionary *task = [weakSelf loadTaskWithId:taskId];
+            if (task) {
+                double progress = [task[KEY_PROGRESS] doubleValue];
+                BOOL wasResumable = [task[KEY_RESUMABLE] boolValue];
+
+                // Force pause status (we assume it can still be resumed later if data exists)
+                @synchronized (self) {
+                    if (_runningTaskById[taskId]) {
+                        _runningTaskById[taskId][KEY_STATUS] = @(STATUS_PAUSED);
+                        _runningTaskById[taskId][KEY_RESUMABLE] = @(wasResumable);
+                    }
+                }
+
+                [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_PAUSED) andProgress:@(progress)];
+
+                dispatch_async(weakSelf.databaseQueue, ^{
+                    [weakSelf updateTask:taskId status:STATUS_PAUSED progress:progress resumable:wasResumable];
+                });
+
+                // Update notification (shows "Paused — xx%" with Resume/Cancel actions)
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress];
+                });
+            } else {
+                if (debug) {
+                    NSLog(@"[FD] pauseTaskWithId: task %@ not found in DB either", taskId);
+                }
+            }
+        }
     }];
 }
 
@@ -288,11 +325,12 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     if (debug) {
         NSLog(@"[FD] cancel task with id: %@", taskId);
     }
+
     __weak typeof(self) weakSelf = self;
 
     [self.currentSession getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data,
-                                                         NSArray<NSURLSessionUploadTask *> *uploads,
-                                                         NSArray<NSURLSessionDownloadTask *> *downloads)
+                                                        NSArray<NSURLSessionUploadTask *> *uploads,
+                                                        NSArray<NSURLSessionDownloadTask *> *downloads)
     {
         BOOL matched = NO;
 
@@ -301,8 +339,9 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
             if (![currentId isEqualToString:taskId]) {
                 continue;
             }
+
             matched = YES;
-            // Cancel for any state except completed/canceling
+
             if (download.state != NSURLSessionTaskStateCompleted &&
                 download.state != NSURLSessionTaskStateCanceling) {
                 if (debug) {
@@ -312,7 +351,11 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
             } else if (debug) {
                 NSLog(@"[FD] cancelTaskWithId:%@ already state=%ld (no-op)", taskId, (long)download.state);
             }
-            break; // found our task
+
+            break;
+        }
+        if (!matched && debug) {
+            NSLog(@"[FD] cancelTaskWithId: no active NSURLSession task found for %@ → forcing cleanup anyway", taskId);
         }
 
         // Flip local/DB/UI to CANCELED *regardless* so user sees immediate effect.
@@ -323,19 +366,21 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         }
 
         [weakSelf sendUpdateProgressForTaskId:taskId
-                                     inStatus:@(STATUS_CANCELED)
-                                  andProgress:@(-1)];
+                                   inStatus:@(STATUS_CANCELED)
+                                 andProgress:@(-1)];
+
         dispatch_async(self.databaseQueue, ^{
             [weakSelf updateTask:taskId status:STATUS_CANCELED progress:-1];
         });
 
         [[FDNotificationCenter shared] removeForTaskId:taskId];
 
-        // Remove any hidden resume blob so it can’t be resumed accidentally.
+        // Remove any hidden resume blob
         NSFileManager *fm = [NSFileManager defaultManager];
         NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
         if ([fm fileExistsAtPath:resumeURL.path]) {
             [fm removeItemAtURL:resumeURL error:nil];
+            if (debug) NSLog(@"[FD] Removed stale resume data for canceled task %@", taskId);
         }
 
         if (debug) {
