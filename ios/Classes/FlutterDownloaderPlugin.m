@@ -896,29 +896,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     });
 }
 
-+ (void)recreateBackgroundSession {
-    FlutterDownloaderPlugin *plugin = [FlutterDownloaderPlugin sharedInstance];
-    if (plugin == nil) {
-        if (debug) NSLog(@"[FD] Cannot recreate session - sharedInstance is nil");
-        return;
-    }
-
-    if (debug) NSLog(@"[FD] Recreating background session via class method");
-
-    NSString *identifier = [NSString stringWithFormat:@"%@.download.background.session", NSBundle.mainBundle.bundleIdentifier];
-    NSNumber *maxConcurrent = [NSBundle.mainBundle objectForInfoDictionaryKey:@"FDMaximumConcurrentTasks"] ?: @3;
-
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:identifier];
-    config.HTTPMaximumConnectionsPerHost = [maxConcurrent intValue];
-
-    // Use the instance to set _session
-    plugin->_session = [NSURLSession sessionWithConfiguration:config
-                                                     delegate:plugin
-                                                delegateQueue:nil];
-
-    if (debug) NSLog(@"[FD] Session recreated successfully");
-}
-
 - (void)openMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
     NSString *taskId = call.arguments[KEY_TASK_ID];
     __typeof__(self) __weak weakSelf = self;
