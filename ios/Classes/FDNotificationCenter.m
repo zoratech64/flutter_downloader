@@ -17,16 +17,50 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
 }
 
 - (void)registerCategories {
-  UNNotificationAction *pause  = [UNNotificationAction actionWithIdentifier:FDActionPause  title:@"Pause"  options:UNNotificationActionOptionNone];
-  UNNotificationAction *resume = [UNNotificationAction actionWithIdentifier:FDActionResume title:@"Resume" options:UNNotificationActionOptionNone];
-  UNNotificationAction *cancel = [UNNotificationAction actionWithIdentifier:FDActionCancel title:@"Cancel" options:UNNotificationActionOptionDestructive];
-  UNNotificationAction *open   = [UNNotificationAction actionWithIdentifier:FDActionOpen   title:@"Open"   options:UNNotificationActionOptionForeground];
+    // Pause action for RUNNING category
+    UNNotificationAction *pause = [UNNotificationAction actionWithIdentifier:FDActionPause
+                                                                       title:@"Pause"
+                                                                     options:UNNotificationActionOptionNone];
 
-  UNNotificationCategory *running = [UNNotificationCategory categoryWithIdentifier:FDCategoryRunning actions:@[pause, cancel] intentIdentifiers:@[] options:UNNotificationCategoryOptionCustomDismissAction];
-  UNNotificationCategory *paused  = [UNNotificationCategory categoryWithIdentifier:FDCategoryPaused  actions:@[resume, cancel] intentIdentifiers:@[] options:UNNotificationCategoryOptionCustomDismissAction];
-  UNNotificationCategory *done    = [UNNotificationCategory categoryWithIdentifier:FDCategoryDone    actions:@[open]           intentIdentifiers:@[] options:UNNotificationCategoryOptionNone];
+    // Resume action for PAUSED category
+    UNNotificationAction *resume = [UNNotificationAction actionWithIdentifier:FDActionResume
+                                                                        title:@"Resume"
+                                                                      options:UNNotificationActionOptionNone];
 
-  [[UNUserNotificationCenter currentNotificationCenter] setNotificationCategories:[NSSet setWithObjects:running, paused, done, nil]];
+    // Cancel action (used in both RUNNING and PAUSED)
+    UNNotificationAction *cancel = [UNNotificationAction actionWithIdentifier:FDActionCancel
+                                                                        title:@"Cancel"
+                                                                      options:UNNotificationActionOptionDestructive];
+
+    // Open action for DONE category (foreground only)
+    UNNotificationAction *open = [UNNotificationAction actionWithIdentifier:FDActionOpen
+                                                                      title:@"Open"
+                                                                    options:UNNotificationActionOptionForeground];
+
+    // RUNNING category: Pause + Cancel
+    UNNotificationCategory *runningCategory = [UNNotificationCategory categoryWithIdentifier:FDCategoryRunning
+                                                                                   actions:@[pause, cancel]
+                                                                         intentIdentifiers:@[]
+                                                                                   options:UNNotificationCategoryOptionCustomDismissAction |
+                                                                                            UNNotificationCategoryOptionAllowAnnouncements];
+
+    // PAUSED category: Resume + Cancel
+    UNNotificationCategory *pausedCategory = [UNNotificationCategory categoryWithIdentifier:FDCategoryPaused
+                                                                                  actions:@[resume, cancel]
+                                                                        intentIdentifiers:@[]
+                                                                                  options:UNNotificationCategoryOptionCustomDismissAction |
+                                                                                           UNNotificationCategoryOptionAllowAnnouncements];
+
+    // DONE category: Open (no destructive, just foreground action)
+    UNNotificationCategory *doneCategory = [UNNotificationCategory categoryWithIdentifier:FDCategoryDone
+                                                                                actions:@[open]
+                                                                      intentIdentifiers:@[]
+                                                                                options:UNNotificationCategoryOptionNone];
+
+    // Register all categories at once
+    NSSet<UNNotificationCategory *> *categories = [NSSet setWithObjects:runningCategory, pausedCategory, doneCategory, nil];
+
+    [[UNUserNotificationCenter currentNotificationCenter] setNotificationCategories:categories];
 }
 
 - (void)ensureAuthorization:(void(^)(void))completion {
@@ -55,40 +89,32 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
                      userInfo:(NSDictionary *)userInfo
                        silent:(BOOL)silent {
 
-  dispatch_async(dispatch_get_main_queue(), ^{
-    UNUserNotificationCenter *c = [UNUserNotificationCenter currentNotificationCenter];
+    // FIXED IDENTIFIER — same for all updates of this task
     NSString *identifier = [NSString stringWithFormat:@"fd.task.%@", taskId];
 
-    UNMutableNotificationContent *content = [UNMutableNotificationContent new];
+    UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
     content.title = title ?: @"Download";
-    content.body  = body ?: @"";
-    if (!silent) content.sound = [UNNotificationSound defaultSound];
-    content.categoryIdentifier = category;                         // <- attaches actions
-    content.threadIdentifier   = [NSString stringWithFormat:@"fd.download.%@", taskId];
+    content.body = body ?: @"";
+    content.categoryIdentifier = category;
+    content.userInfo = userInfo ?: @{@"taskId": taskId};
 
-    NSMutableDictionary *info = userInfo ? [userInfo mutableCopy] : [NSMutableDictionary new];
-    info[@"taskId"]  = taskId ?: @"";                              // <- both keys (new & legacy)
-    info[@"task_id"] = taskId ?: @"";
-    content.userInfo = info;
-
-    if (@available(iOS 15.0, *)) {
-      content.interruptionLevel = silent ? UNNotificationInterruptionLevelPassive
-                                         : UNNotificationInterruptionLevelActive;
+    if (!silent) {
+        content.sound = [UNNotificationSound defaultSound];
     }
 
-    // IMPORTANT: immediate delivery; do NOT remove previous card first
-    UNNotificationRequest *req =
-      [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
+    // No trigger = immediate delivery
+    UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:identifier
+                                                                           content:content
+                                                                           trigger:nil];
 
-    // (Optional) debug – leave for now while you test:
-    NSLog(@"[FD] post id=%@ cat=%@ title=%@ body=%@ silent=%@ userInfo=%@",
-          identifier, content.categoryIdentifier, content.title, content.body,
-          silent?@"YES":@"NO", content.userInfo);
-
-    [c addNotificationRequest:req withCompletionHandler:^(NSError * _Nullable error) {
-      if (error) NSLog(@"FDNotificationCenter addNotificationRequest error: %@", error);
+    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request
+                                                               withCompletionHandler:^(NSError *error) {
+        if (error) {
+            NSLog(@"[FD] Failed to add/update notification: %@", error);
+        } else {
+            if (debug) NSLog(@"[FD] Notification added/updated for task %@ with ID %@", taskId, identifier);
+        }
     }];
-  });
 }
 
 - (void)removeForTaskId:(NSString *)taskId {
