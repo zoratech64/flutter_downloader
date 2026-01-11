@@ -1029,6 +1029,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
             if (resumeData) {
                 NSURLSessionDownloadTask *task = [[weakSelf currentSession] downloadTaskWithResumeData:resumeData];
                 NSString *newTaskId = [weakSelf createTaskId];
+                [[FDNotificationCenter shared] removeForTaskId:taskId];
                 task.taskDescription = newTaskId;
                 [task resume];
 
@@ -1446,21 +1447,38 @@ didReceiveNotificationResponse:(UNNotificationResponse *)response
 
     if (taskId.length == 0) { if (completionHandler) completionHandler(); return; }
 
-    if ([action isEqualToString:FDActionPause]) {
+        if ([action isEqualToString:FDActionPause]) {
+
+        // 1) Update notification immediately so iOS doesn't "dismiss and vanish" it
+        NSDictionary *t = [self loadTaskWithId:taskId];
+        double pct = 0;
+        if (t && t[@"progress"]) {
+            pct = [t[@"progress"] doubleValue];
+        }
+        [self fd_updatePausedNotificationForTaskId:taskId progress:pct];
+
+        // 2) Then perform actual pause
         [self pauseTaskWithId:taskId];
-        // Show “Paused” card (Resume/Cancel) — DO NOT remove
-        // double pct = [[self loadTaskWithId:taskId][@"progress"] doubleValue];
-        // [self fd_updatePausedNotificationForTaskId:taskId progress:pct];
+
     } else if ([action isEqualToString:FDActionResume]) {
+
+        // 1) Update notification immediately so it flips back to running UI
+        NSDictionary *t = [self loadTaskWithId:taskId];
+        double pct = 0;
+        if (t && t[@"progress"]) {
+            pct = [t[@"progress"] doubleValue];
+        }
+        [self fd_updateRunningNotificationForTaskId:taskId progress:pct];
+
+        // 2) Then resume
         [self resumeTaskWithIdFromNotification:taskId];
-        // Show “Downloading” card (Pause/Cancel) — DO NOT remove
-        // double pct = [[self loadTaskWithId:taskId][@"progress"] doubleValue];
-        // [self fd_updateRunningNotificationForTaskId:taskId progress:pct];
+
     } else if ([action isEqualToString:FDActionCancel]) {
-        // Only Cancel removes the card
         [self cancelTaskWithId:taskId];
     }
+
     if (completionHandler) completionHandler();
+
 }
 
 // Show a banner only once per task while the app is in foreground.

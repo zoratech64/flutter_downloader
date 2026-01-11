@@ -123,4 +123,16 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
   [c removePendingNotificationRequestsWithIdentifiers:@[identifier]];
   [c removeDeliveredNotificationsWithIdentifiers:@[identifier]];
 }
+
+- (void)moveNotificationFromTaskId:(NSString *)oldTaskId toTaskId:(NSString *)newTaskId {
+    if (!oldTaskId.length || !newTaskId.length || [oldTaskId isEqualToString:newTaskId]) return;
+
+    UNUserNotificationCenter *c = [UNUserNotificationCenter currentNotificationCenter];
+    NSString *oldIdentifier = [NSString stringWithFormat:@"fd.task.%@", oldTaskId];
+
+    // Remove the old notification so only the new one remains visible
+    [c removePendingNotificationRequestsWithIdentifiers:@[oldIdentifier]];
+    [c removeDeliveredNotificationsWithIdentifiers:@[oldIdentifier]];
+}
+
 @end
