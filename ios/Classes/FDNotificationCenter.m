@@ -42,14 +42,14 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
                                                                                    actions:@[pause, cancel]
                                                                          intentIdentifiers:@[]
                                                                                    options:UNNotificationCategoryOptionCustomDismissAction |
-                                                                                            UNNotificationCategoryOptionAllowAnnouncements];
+                                                                                            UNNotificationCategoryOptionAllowAnnouncement];
 
     // PAUSED category: Resume + Cancel
     UNNotificationCategory *pausedCategory = [UNNotificationCategory categoryWithIdentifier:FDCategoryPaused
                                                                                   actions:@[resume, cancel]
                                                                         intentIdentifiers:@[]
                                                                                   options:UNNotificationCategoryOptionCustomDismissAction |
-                                                                                           UNNotificationCategoryOptionAllowAnnouncements];
+                                                                                           UNNotificationCategoryOptionAllowAnnouncement];
 
     // DONE category: Open (no destructive, just foreground action)
     UNNotificationCategory *doneCategory = [UNNotificationCategory categoryWithIdentifier:FDCategoryDone
@@ -112,7 +112,7 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
         if (error) {
             NSLog(@"[FD] Failed to add/update notification: %@", error);
         } else {
-            if (debug) NSLog(@"[FD] Notification added/updated for task %@ with ID %@", taskId, identifier);
+            NSLog(@"[FD] Notification added/updated for task %@ with ID %@", taskId, identifier);
         }
     }];
 }
