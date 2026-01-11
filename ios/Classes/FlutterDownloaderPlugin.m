@@ -225,14 +225,20 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     if (debug) {
         NSLog(@"pause task with id: %@", taskId);
     }
+
     __typeof__(self) __weak weakSelf = self;
 
     [[self currentSession] getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data,
-                                                           NSArray<NSURLSessionUploadTask *> *uploads,
-                                                           NSArray<NSURLSessionDownloadTask *> *downloads) {
+                                                          NSArray<NSURLSessionUploadTask *> *uploads,
+                                                          NSArray<NSURLSessionDownloadTask *> *downloads) {
+
+        BOOL matched = NO;
+
         for (NSURLSessionDownloadTask *download in downloads) {
             if ([taskId isEqualToString:[weakSelf identifierForTask:download]] &&
                 (download.state == NSURLSessionTaskStateRunning)) {
+
+                matched = YES;
 
                 NSDictionary *task = [weakSelf loadTaskWithId:taskId];
                 double progress = [task[@"progress"] doubleValue];
@@ -256,16 +262,18 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                     }
 
                     @synchronized (self) {
-                        _runningTaskById[taskId][KEY_PROGRESS]  = @(progress);
-                        _runningTaskById[taskId][KEY_STATUS]    = @(STATUS_PAUSED);
+                        _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
+                        _runningTaskById[taskId][KEY_STATUS] = @(STATUS_PAUSED);
                         _runningTaskById[taskId][KEY_RESUMABLE] = @(haveResumeData ? YES : NO);
                     }
 
                     [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_PAUSED) andProgress:@(progress)];
+
                     dispatch_async(self.databaseQueue, ^{
                         [weakSelf updateTask:taskId status:STATUS_PAUSED progress:progress resumable:haveResumeData];
                     });
 
+                    // Delayed updates (your existing retry logic is good)
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                         [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress];
                     });
@@ -273,13 +281,55 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
                         [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress];
                     });
                 }];
-                return;
+
+                return;  // Early exit — we handled it
             }
         }
 
-        // (Optional) If no running task matched, do nothing here.
-        // You could log for diagnosis:
-        if (debug) NSLog(@"[FD] pauseTaskWithId: no running task matched %@", taskId);
+        // ────────────────────────────────────────────────────────────────
+        // Fallback: No active task found → force pause in DB + notification
+        // ────────────────────────────────────────────────────────────────
+        if (!matched) {
+            if (debug) {
+                NSLog(@"[FD] pauseTaskWithId: no running task matched for %@ → forcing pause via DB", taskId);
+            }
+
+            NSDictionary *task = [weakSelf loadTaskWithId:taskId];
+            if (task) {
+                double progress = [task[KEY_PROGRESS] doubleValue];
+                BOOL wasResumable = [task[KEY_RESUMABLE] boolValue];
+
+                // Force update in-memory cache
+                @synchronized (self) {
+                    if (_runningTaskById[taskId]) {
+                        _runningTaskById[taskId][KEY_STATUS] = @(STATUS_PAUSED);
+                        _runningTaskById[taskId][KEY_RESUMABLE] = @(wasResumable);
+                    }
+                }
+
+                [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_PAUSED) andProgress:@(progress)];
+
+                dispatch_async(weakSelf.databaseQueue, ^{
+                    [weakSelf updateTask:taskId status:STATUS_PAUSED progress:progress resumable:wasResumable];
+                });
+
+                // Immediate + delayed notification update (ensures it sticks)
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress];
+                });
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [weakSelf fd_updatePausedNotificationForTaskId:taskId progress:progress];
+                });
+            } else {
+                if (debug) {
+                    NSLog(@"[FD] pauseTaskWithId: task %@ not found in DB either", taskId);
+                }
+            }
+        } else {
+            if (debug) {
+                NSLog(@"[FD] pauseTaskWithId: task %@ was matched and paused normally", taskId);
+            }
+        }
     }];
 }
 
