@@ -23,6 +23,7 @@ enum DownloadTaskStatus {
   paused;
 
   /// Creates a new [DownloadTaskStatus] from an [int].
+  @pragma('vm:entry-point')
   factory DownloadTaskStatus.fromInt(int value) {
     switch (value) {
       case 0:
@@ -48,6 +49,7 @@ enum DownloadTaskStatus {
 /// Encapsulates all information of a single download task.
 ///
 /// This is also the structure of the record saved in the SQLite database.
+@pragma('vm:entry-point')
 class DownloadTask {
   /// Creates a new [DownloadTask].
   DownloadTask({
