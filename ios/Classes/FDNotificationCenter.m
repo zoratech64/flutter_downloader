@@ -100,8 +100,11 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
     if ([category isEqualToString:FDCategoryDone])   identifier = doneId;
 
     NSArray *allIds = @[runningId, pausedId, doneId];
-    [c removePendingNotificationRequestsWithIdentifiers:allIds];
-    [c removeDeliveredNotificationsWithIdentifiers:allIds];
+    NSMutableArray *toRemove = [NSMutableArray arrayWithArray:allIds];
+    [toRemove removeObject:identifier];
+
+    [c removePendingNotificationRequestsWithIdentifiers:toRemove];
+    [c removeDeliveredNotificationsWithIdentifiers:toRemove];
 
     UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
     content.title = title ?: @"Download";
@@ -117,15 +120,11 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
     }
 
     UNNotificationRequest *request =
-        [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [c addNotificationRequest:request withCompletionHandler:^(NSError *error) {
-            if (error) {
-                NSLog(@"[FD] Failed to add/update notification: %@", error);
-            }
-        }];
-    });
+    [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
+
+    [c addNotificationRequest:request withCompletionHandler:^(NSError *error) {
+        if (error) NSLog(@"[FD] Failed to add/update notification: %@", error);
+    }];
 }
 
 - (void)removeForTaskId:(NSString *)taskId {
