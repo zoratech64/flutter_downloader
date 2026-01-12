@@ -339,79 +339,70 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         NSLog(@"[FD] cancel task with id: %@", taskId);
     }
     __weak typeof(self) weakSelf = self;
-    __block NSString *redirectId = nil;
+    __block NSString *redirectTo = nil;
+    __block NSString *redirectFrom = nil;
     @synchronized (self) {
-        redirectId = self.fd_taskInfo[taskId][@"redirectTo"];
+        redirectTo = self.fd_taskInfo[taskId][@"redirectTo"];
+        redirectFrom = self.fd_taskInfo[taskId][@"redirectFrom"];
     }
+
+    NSMutableOrderedSet<NSString *> *idsToRemove = [NSMutableOrderedSet orderedSet];
+    if (taskId.length) [idsToRemove addObject:taskId];
+    if (redirectTo.length && ![redirectTo isEqualToString:taskId]) [idsToRemove addObject:redirectTo];
+    if (redirectFrom.length && ![redirectFrom isEqualToString:taskId]) [idsToRemove addObject:redirectFrom];
 
     [self.currentSession getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data,
                                                          NSArray<NSURLSessionUploadTask *> *uploads,
                                                          NSArray<NSURLSessionDownloadTask *> *downloads)
     {
-        BOOL matched = NO;
+        // Cancel any matching session task(s)
         for (NSURLSessionDownloadTask *download in downloads) {
             NSString *currentId = [weakSelf identifierForTask:download];
-            if (![currentId isEqualToString:taskId]) {
-                continue;
-            }
-            matched = YES;
+            if (![idsToRemove containsObject:currentId]) continue;
+
             if (download.state != NSURLSessionTaskStateCompleted &&
                 download.state != NSURLSessionTaskStateCanceling) {
                 if (debug) {
-                    NSLog(@"[FD] cancelTaskWithId:%@ matched state=%ld → calling -cancel",
-                          taskId, (long)download.state);
+                    NSLog(@"[FD] cancelTaskWithId:%@ matched %@ state=%ld → calling -cancel",
+                          taskId, currentId, (long)download.state);
                 }
                 [download cancel];
-            } else if (debug) {
-                NSLog(@"[FD] cancelTaskWithId:%@ already state=%ld (no-op)",
-                      taskId, (long)download.state);
             }
-            break;
-        }
-
-        @synchronized (self) {
-            [_runningTaskById removeObjectForKey:taskId];
-            [self.fd_pausingTaskIds removeObject:taskId];
-            [self.fd_didShowBannerForTask removeObject:taskId];
-            [self.fd_taskInfo removeObjectForKey:taskId];
         }
 
         [weakSelf sendUpdateProgressForTaskId:taskId
                                      inStatus:@(STATUS_CANCELED)
                                   andProgress:@(-1)];
+
         dispatch_async(self.databaseQueue, ^{
-            [weakSelf updateTask:taskId status:STATUS_CANCELED progress:-1];
+            for (NSString *tid in idsToRemove) {
+                [weakSelf updateTask:tid status:STATUS_CANCELED progress:-1];
+            }
         });
 
-        [[FDNotificationCenter shared] removeForTaskId:taskId];
-        if (redirectId && redirectId.length > 0 && ![redirectId isEqualToString:taskId]) {
-            [[FDNotificationCenter shared] removeForTaskId:redirectId];
-            @synchronized (self) {
-                [_runningTaskById removeObjectForKey:redirectId];
-                [self.fd_pausingTaskIds removeObject:redirectId];
-                [self.fd_didShowBannerForTask removeObject:redirectId];
-                [self.fd_taskInfo removeObjectForKey:redirectId];
-            }
+        for (NSString *tid in idsToRemove) {
+            [[FDNotificationCenter shared] removeForTaskId:tid];
         }
 
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
-        if ([fm fileExistsAtPath:resumeURL.path]) {
-            [fm removeItemAtURL:resumeURL error:nil];
+        for (NSString *tid in idsToRemove) {
+            NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:tid];
+            if ([fm fileExistsAtPath:resumeURL.path]) {
+                [fm removeItemAtURL:resumeURL error:nil];
+            }
         }
 
-        if (redirectId && redirectId.length > 0 && ![redirectId isEqualToString:taskId]) {
-            NSURL *resumeURL2 = [weakSelf fd_resumeURLForTaskId:redirectId];
-            if ([fm fileExistsAtPath:resumeURL2.path]) {
-                [fm removeItemAtURL:resumeURL2 error:nil];
+        @synchronized (self) {
+            for (NSString *tid in idsToRemove) {
+                [_runningTaskById removeObjectForKey:tid];
+                [self.fd_pausingTaskIds removeObject:tid];
+                [self.fd_didShowBannerForTask removeObject:tid];
+                [self.fd_taskInfo removeObjectForKey:tid];
             }
         }
 
         if (debug) {
-            NSLog(@"[FD] cancelTaskWithId:%@ → matched=%@", taskId, (matched ? @"YES" : @"NO"));
-            if (redirectId && redirectId.length > 0) {
-                NSLog(@"[FD] cancelTaskWithId:%@ → also removed redirected id %@", taskId, redirectId);
-            }
+            NSLog(@"[FD] cancelTaskWithId:%@ → removed notifications for ids=%@", taskId, idsToRemove.array);
         }
     }];
 }
@@ -1057,10 +1048,11 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         NSString *newTaskId = [weakSelf createTaskId];
 
         @synchronized (weakSelf) {
-            NSMutableDictionary *info = [weakSelf fd_taskInfoForId:taskId];
-            if (info) {
-                info[@"redirectTo"] = newTaskId;
-            }
+            NSMutableDictionary *oldInfo = [weakSelf fd_taskInfoForId:taskId];
+            oldInfo[@"redirectTo"] = newTaskId;
+
+            NSMutableDictionary *newInfo = [weakSelf fd_taskInfoForId:newTaskId];
+            newInfo[@"redirectFrom"] = taskId;
         }
 
         [[FDNotificationCenter shared] removeForTaskId:taskId];
