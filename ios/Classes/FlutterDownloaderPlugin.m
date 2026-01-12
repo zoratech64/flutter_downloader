@@ -339,37 +339,41 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         NSLog(@"[FD] cancel task with id: %@", taskId);
     }
     __weak typeof(self) weakSelf = self;
+    __block NSString *redirectId = nil;
+    @synchronized (self) {
+        redirectId = self.fd_taskInfo[taskId][@"redirectTo"];
+    }
 
     [self.currentSession getTasksWithCompletionHandler:^(NSArray<NSURLSessionDataTask *> *data,
                                                          NSArray<NSURLSessionUploadTask *> *uploads,
                                                          NSArray<NSURLSessionDownloadTask *> *downloads)
     {
         BOOL matched = NO;
-
         for (NSURLSessionDownloadTask *download in downloads) {
             NSString *currentId = [weakSelf identifierForTask:download];
             if (![currentId isEqualToString:taskId]) {
                 continue;
             }
             matched = YES;
-            // Cancel for any state except completed/canceling
             if (download.state != NSURLSessionTaskStateCompleted &&
                 download.state != NSURLSessionTaskStateCanceling) {
                 if (debug) {
-                    NSLog(@"[FD] cancelTaskWithId:%@ matched state=%ld → calling -cancel", taskId, (long)download.state);
+                    NSLog(@"[FD] cancelTaskWithId:%@ matched state=%ld → calling -cancel",
+                          taskId, (long)download.state);
                 }
                 [download cancel];
             } else if (debug) {
-                NSLog(@"[FD] cancelTaskWithId:%@ already state=%ld (no-op)", taskId, (long)download.state);
+                NSLog(@"[FD] cancelTaskWithId:%@ already state=%ld (no-op)",
+                      taskId, (long)download.state);
             }
-            break; // found our task
+            break;
         }
 
-        // Flip local/DB/UI to CANCELED *regardless* so user sees immediate effect.
         @synchronized (self) {
             [_runningTaskById removeObjectForKey:taskId];
             [self.fd_pausingTaskIds removeObject:taskId];
             [self.fd_didShowBannerForTask removeObject:taskId];
+            [self.fd_taskInfo removeObjectForKey:taskId];
         }
 
         [weakSelf sendUpdateProgressForTaskId:taskId
@@ -380,16 +384,34 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         });
 
         [[FDNotificationCenter shared] removeForTaskId:taskId];
+        if (redirectId && redirectId.length > 0 && ![redirectId isEqualToString:taskId]) {
+            [[FDNotificationCenter shared] removeForTaskId:redirectId];
+            @synchronized (self) {
+                [_runningTaskById removeObjectForKey:redirectId];
+                [self.fd_pausingTaskIds removeObject:redirectId];
+                [self.fd_didShowBannerForTask removeObject:redirectId];
+                [self.fd_taskInfo removeObjectForKey:redirectId];
+            }
+        }
 
-        // Remove any hidden resume blob so it can’t be resumed accidentally.
         NSFileManager *fm = [NSFileManager defaultManager];
         NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
         if ([fm fileExistsAtPath:resumeURL.path]) {
             [fm removeItemAtURL:resumeURL error:nil];
         }
 
+        if (redirectId && redirectId.length > 0 && ![redirectId isEqualToString:taskId]) {
+            NSURL *resumeURL2 = [weakSelf fd_resumeURLForTaskId:redirectId];
+            if ([fm fileExistsAtPath:resumeURL2.path]) {
+                [fm removeItemAtURL:resumeURL2 error:nil];
+            }
+        }
+
         if (debug) {
             NSLog(@"[FD] cancelTaskWithId:%@ → matched=%@", taskId, (matched ? @"YES" : @"NO"));
+            if (redirectId && redirectId.length > 0) {
+                NSLog(@"[FD] cancelTaskWithId:%@ → also removed redirected id %@", taskId, redirectId);
+            }
         }
     }];
 }
@@ -1020,38 +1042,50 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 
 - (void)resumeTaskWithIdFromNotification:(NSString *)taskId {
     __typeof__(self) __weak weakSelf = self;
+
     dispatch_async(self.databaseQueue, ^{
-        NSDictionary* taskDict = [weakSelf loadTaskWithId:taskId];
-        if (taskDict && [taskDict[KEY_STATUS] intValue] == STATUS_PAUSED) {
-            NSURL *partialFileURL = [weakSelf fileUrlFromDict:taskDict];
-            NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
-            NSData *resumeData = [NSData dataWithContentsOfURL:resumeURL];
-            if (resumeData) {
-                NSURLSessionDownloadTask *task = [[weakSelf currentSession] downloadTaskWithResumeData:resumeData];
-                NSString *newTaskId = [weakSelf createTaskId];
-                [[FDNotificationCenter shared] removeForTaskId:taskId];
-                task.taskDescription = newTaskId;
-                [task resume];
+        NSDictionary *taskDict = [weakSelf loadTaskWithId:taskId];
+        if (!taskDict) return;
 
-                NSFileManager *fm = [NSFileManager defaultManager];
-                if ([fm fileExistsAtPath:resumeURL.path]) {
-                    [fm removeItemAtURL:resumeURL error:nil];
-                }
+        if ([taskDict[KEY_STATUS] intValue] != STATUS_PAUSED) return;
 
-                @synchronized(self) {
-                    NSMutableDictionary *newTask = [NSMutableDictionary dictionaryWithDictionary:taskDict];
-                    newTask[KEY_STATUS] = @(STATUS_RUNNING);
-                    newTask[KEY_RESUMABLE] = @(NO);
-                    _runningTaskById[newTaskId] = newTask;
-                    [_runningTaskById removeObjectForKey:taskId];
-                }
-                
-                [weakSelf updateTask:taskId newTaskId:newTaskId status:STATUS_RUNNING resumable:NO];
-                [weakSelf sendUpdateProgressForTaskId:newTaskId inStatus:@(STATUS_RUNNING) andProgress:taskDict[KEY_PROGRESS]];
-                // Silent UI update
-                [weakSelf fd_postResumeNotificationForTaskId:newTaskId];
+        NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
+        NSData *resumeData = [NSData dataWithContentsOfURL:resumeURL];
+        if (!resumeData) return;
+
+        NSURLSessionDownloadTask *task = [[weakSelf currentSession] downloadTaskWithResumeData:resumeData];
+        NSString *newTaskId = [weakSelf createTaskId];
+
+        @synchronized (weakSelf) {
+            NSMutableDictionary *info = [weakSelf fd_taskInfoForId:taskId];
+            if (info) {
+                info[@"redirectTo"] = newTaskId;
             }
         }
+
+        [[FDNotificationCenter shared] removeForTaskId:taskId];
+        task.taskDescription = newTaskId;
+        [task resume];
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if ([fm fileExistsAtPath:resumeURL.path]) {
+            [fm removeItemAtURL:resumeURL error:nil];
+        }
+
+        @synchronized (weakSelf) {
+            NSMutableDictionary *newTask = [NSMutableDictionary dictionaryWithDictionary:taskDict];
+            newTask[KEY_STATUS] = @(STATUS_RUNNING);
+            newTask[KEY_RESUMABLE] = @(NO);
+
+            _runningTaskById[newTaskId] = newTask;
+            [_runningTaskById removeObjectForKey:taskId];
+        }
+
+        [weakSelf updateTask:taskId newTaskId:newTaskId status:STATUS_RUNNING resumable:NO];
+        [weakSelf sendUpdateProgressForTaskId:newTaskId
+                                     inStatus:@(STATUS_RUNNING)
+                                  andProgress:taskDict[KEY_PROGRESS]];
+        [weakSelf fd_postResumeNotificationForTaskId:newTaskId];
     });
 }
 

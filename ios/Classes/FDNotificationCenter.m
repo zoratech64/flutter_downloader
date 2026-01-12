@@ -89,7 +89,8 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
                      userInfo:(NSDictionary *)userInfo
                        silent:(BOOL)silent {
 
-    // Use different IDs per state so switching states re-delivers visibly
+    UNUserNotificationCenter *c = [UNUserNotificationCenter currentNotificationCenter];
+
     NSString *runningId = [NSString stringWithFormat:@"fd.task.%@.running", taskId];
     NSString *pausedId  = [NSString stringWithFormat:@"fd.task.%@.paused",  taskId];
     NSString *doneId    = [NSString stringWithFormat:@"fd.task.%@.done",    taskId];
@@ -98,9 +99,8 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
     if ([category isEqualToString:FDCategoryPaused]) identifier = pausedId;
     if ([category isEqualToString:FDCategoryDone])   identifier = doneId;
 
-    // Remove other state notifications so only ONE row exists
-    UNUserNotificationCenter *c = [UNUserNotificationCenter currentNotificationCenter];
-    NSMutableArray *toRemove = [NSMutableArray arrayWithObjects:runningId, pausedId, doneId, nil];
+    NSArray *allIds = @[runningId, pausedId, doneId];
+    NSMutableArray *toRemove = [NSMutableArray arrayWithArray:allIds];
     [toRemove removeObject:identifier];
 
     [c removePendingNotificationRequestsWithIdentifiers:toRemove];
@@ -115,21 +115,15 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
     if (!silent) {
         content.sound = [UNNotificationSound defaultSound];
     }
-
-    // iOS 15+ (optional but helps "silent" behave nicely)
     if (@available(iOS 15.0, *)) {
         content.interruptionLevel = UNNotificationInterruptionLevelPassive;
     }
 
     UNNotificationRequest *request =
-      [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
+    [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
 
     [c addNotificationRequest:request withCompletionHandler:^(NSError *error) {
-        if (error) {
-            NSLog(@"[FD] Failed to add/update notification: %@", error);
-        } else {
-            NSLog(@"[FD] Notification added/updated for task %@ with ID %@", taskId, identifier);
-        }
+        if (error) NSLog(@"[FD] Failed to add/update notification: %@", error);
     }];
 }
 
