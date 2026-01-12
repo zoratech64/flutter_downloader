@@ -89,8 +89,22 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
                      userInfo:(NSDictionary *)userInfo
                        silent:(BOOL)silent {
 
-    // FIXED IDENTIFIER — same for all updates of this task
-    NSString *identifier = [NSString stringWithFormat:@"fd.task.%@", taskId];
+    // Use different IDs per state so switching states re-delivers visibly
+    NSString *runningId = [NSString stringWithFormat:@"fd.task.%@.running", taskId];
+    NSString *pausedId  = [NSString stringWithFormat:@"fd.task.%@.paused",  taskId];
+    NSString *doneId    = [NSString stringWithFormat:@"fd.task.%@.done",    taskId];
+
+    NSString *identifier = runningId;
+    if ([category isEqualToString:FDCategoryPaused]) identifier = pausedId;
+    if ([category isEqualToString:FDCategoryDone])   identifier = doneId;
+
+    // Remove other state notifications so only ONE row exists
+    UNUserNotificationCenter *c = [UNUserNotificationCenter currentNotificationCenter];
+    NSMutableArray *toRemove = [NSMutableArray arrayWithObjects:runningId, pausedId, doneId, nil];
+    [toRemove removeObject:identifier];
+
+    [c removePendingNotificationRequestsWithIdentifiers:toRemove];
+    [c removeDeliveredNotificationsWithIdentifiers:toRemove];
 
     UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
     content.title = title ?: @"Download";
@@ -102,13 +116,15 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
         content.sound = [UNNotificationSound defaultSound];
     }
 
-    // No trigger = immediate delivery
-    UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:identifier
-                                                                           content:content
-                                                                           trigger:nil];
+    // iOS 15+ (optional but helps "silent" behave nicely)
+    if (@available(iOS 15.0, *)) {
+        content.interruptionLevel = UNNotificationInterruptionLevelPassive;
+    }
 
-    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request
-                                                               withCompletionHandler:^(NSError *error) {
+    UNNotificationRequest *request =
+      [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
+
+    [c addNotificationRequest:request withCompletionHandler:^(NSError *error) {
         if (error) {
             NSLog(@"[FD] Failed to add/update notification: %@", error);
         } else {
@@ -119,9 +135,13 @@ NSString * const FDActionOpen   = @"FD_ACTION_OPEN";
 
 - (void)removeForTaskId:(NSString *)taskId {
   UNUserNotificationCenter *c = [UNUserNotificationCenter currentNotificationCenter];
-  NSString *identifier = [NSString stringWithFormat:@"fd.task.%@", taskId];
-  [c removePendingNotificationRequestsWithIdentifiers:@[identifier]];
-  [c removeDeliveredNotificationsWithIdentifiers:@[identifier]];
+  NSString *runningId = [NSString stringWithFormat:@"fd.task.%@.running", taskId];
+  NSString *pausedId  = [NSString stringWithFormat:@"fd.task.%@.paused",  taskId];
+  NSString *doneId    = [NSString stringWithFormat:@"fd.task.%@.done",    taskId];
+
+  NSArray *ids = @[runningId, pausedId, doneId];
+  [c removePendingNotificationRequestsWithIdentifiers:ids];
+  [c removeDeliveredNotificationsWithIdentifiers:ids];
 }
 
 - (void)moveNotificationFromTaskId:(NSString *)oldTaskId toTaskId:(NSString *)newTaskId {
