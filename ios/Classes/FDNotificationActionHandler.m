@@ -1,8 +1,5 @@
 // FDNotificationActionHandler.m
 #import "FDNotificationActionHandler.h"
-#import "FDNotificationCenter.h"
-#import "FlutterDownloaderPlugin.h"
-#import <UserNotifications/UserNotifications.h>
 
 @implementation FDNotificationActionHandler
 
@@ -12,26 +9,20 @@
   return s;
 }
 
-/**
- * In the new design, the FlutterDownloaderPlugin is the UNUserNotificationCenter delegate.
- * So this handler no longer implements those delegate callbacks.
- * Instead, it provides helper methods to forward actions manually if ever needed.
- */
-
 - (void)attachAsDelegateIfNeeded {
-  // Intentionally left blank — plugin sets itself as delegate.
+  // No-op
 }
 
 + (void)handlePauseForTaskId:(NSString *)taskId {
-  [FlutterDownloaderPlugin handleNotificationActionPause:taskId];
+  // No-op
 }
 
 + (void)handleResumeForTaskId:(NSString *)taskId {
-  [FlutterDownloaderPlugin handleNotificationActionResume:taskId];
+  // No-op
 }
 
 + (void)handleCancelForTaskId:(NSString *)taskId {
-  [FlutterDownloaderPlugin handleNotificationActionCancel:taskId];
+  // No-op
 }
 
 @end

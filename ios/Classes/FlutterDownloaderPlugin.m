@@ -816,34 +816,27 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 
                 if (resumeData != nil) {
                     NSURLSessionDownloadTask *task = [[weakSelf currentSession] downloadTaskWithResumeData:resumeData];
-                    NSString *newTaskId = [weakSelf createTaskId];
-                    task.taskDescription = newTaskId;
+                    task.taskDescription = taskId;
                     [task resume];
-
                     NSFileManager *fm = [NSFileManager defaultManager];
                     if ([fm fileExistsAtPath:resumeURL.path]) {
                         [fm removeItemAtURL:resumeURL error:nil];
                     }
-
                     @synchronized(self) {
-                        NSMutableDictionary *newTask = [NSMutableDictionary dictionaryWithDictionary:taskDict];
-                        newTask[KEY_STATUS] = @(STATUS_RUNNING);
-                        newTask[KEY_RESUMABLE] = @(NO);
-                        _runningTaskById[newTaskId] = newTask;
-                        [_runningTaskById removeObjectForKey:taskId];
+                        NSMutableDictionary *sameTask = [NSMutableDictionary dictionaryWithDictionary:taskDict];
+                        sameTask[KEY_STATUS] = @(STATUS_RUNNING);
+                        sameTask[KEY_RESUMABLE] = @(NO);
+                        _runningTaskById[taskId] = sameTask;
                     }
-                    double pct = [[weakSelf loadTaskWithId:newTaskId ?: taskId][@"progress"] doubleValue];
-                    [weakSelf fd_updateRunningNotificationForTaskId:(newTaskId ?: taskId) progress:pct];
-                    [weakSelf updateTask:taskId newTaskId:newTaskId status:STATUS_RUNNING resumable:NO];
-                    NSDictionary *updatedTask = [weakSelf loadTaskWithId:newTaskId];
-                    NSNumber *progress = updatedTask[KEY_PROGRESS];
-                    [weakSelf sendUpdateProgressForTaskId:newTaskId inStatus:@(STATUS_RUNNING) andProgress:progress];
-                    
-                    // Post a silent resume update (no new banner)
-                    [weakSelf fd_postResumeNotificationForTaskId:newTaskId];
+                    double pct = [taskDict[KEY_PROGRESS] doubleValue];
+                    [weakSelf updateTask:taskId status:STATUS_RUNNING progress:pct resumable:NO];
 
+                    NSDictionary *updatedTask = [weakSelf loadTaskWithId:taskId];
+                    NSNumber *progress = updatedTask[KEY_PROGRESS] ?: @(0);
+                    [weakSelf sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_RUNNING) andProgress:progress];
+                    [weakSelf fd_postResumeNotificationForTaskId:taskId];
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        result(newTaskId);
+                        result(taskId);
                     });
                 } else {
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -995,9 +988,6 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
   FlutterDownloaderPlugin *plugin = [[FlutterDownloaderPlugin alloc] init:registrar];
   [registrar addApplicationDelegate:plugin];
   _sharedInstance = plugin;
-
-  // Keep your category setup and permission prompt via helper
-  [[FDNotificationCenter shared] registerCategories];
   [[FDNotificationCenter shared] ensureAuthorization:^{}];
 
   // Set UNUserNotificationCenter delegate to this plugin instance,
@@ -1013,72 +1003,13 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 
 #pragma mark - Notification Actions
 
-+ (void)handleNotificationActionPause:(NSString *)taskId {
-    if ([self sharedInstance]) {
-        [[self sharedInstance] pauseTaskWithId:taskId];
-    }
-}
++ (void)handleNotificationActionPause:(NSString *)taskId { /* no-op */ }
++ (void)handleNotificationActionResume:(NSString *)taskId { /* no-op */ }
++ (void)handleNotificationActionCancel:(NSString *)taskId { /* no-op */ }
 
-+ (void)handleNotificationActionResume:(NSString *)taskId {
-    if ([self sharedInstance]) {
-        [[self sharedInstance] resumeTaskWithIdFromNotification:taskId];
-    }
-}
-
-+ (void)handleNotificationActionCancel:(NSString *)taskId {
-    if ([self sharedInstance]) {
-        [[self sharedInstance] cancelTaskWithId:taskId];
-    }
-}
 
 - (void)resumeTaskWithIdFromNotification:(NSString *)taskId {
-    __typeof__(self) __weak weakSelf = self;
-
-    dispatch_async(self.databaseQueue, ^{
-        NSDictionary *taskDict = [weakSelf loadTaskWithId:taskId];
-        if (!taskDict) return;
-
-        if ([taskDict[KEY_STATUS] intValue] != STATUS_PAUSED) return;
-
-        NSURL *resumeURL = [weakSelf fd_resumeURLForTaskId:taskId];
-        NSData *resumeData = [NSData dataWithContentsOfURL:resumeURL];
-        if (!resumeData) return;
-
-        NSURLSessionDownloadTask *task = [[weakSelf currentSession] downloadTaskWithResumeData:resumeData];
-        NSString *newTaskId = [weakSelf createTaskId];
-
-        @synchronized (weakSelf) {
-            NSMutableDictionary *oldInfo = [weakSelf fd_taskInfoForId:taskId];
-            oldInfo[@"redirectTo"] = newTaskId;
-
-            NSMutableDictionary *newInfo = [weakSelf fd_taskInfoForId:newTaskId];
-            newInfo[@"redirectFrom"] = taskId;
-        }
-
-        [[FDNotificationCenter shared] removeForTaskId:taskId];
-        task.taskDescription = newTaskId;
-        [task resume];
-
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if ([fm fileExistsAtPath:resumeURL.path]) {
-            [fm removeItemAtURL:resumeURL error:nil];
-        }
-
-        @synchronized (weakSelf) {
-            NSMutableDictionary *newTask = [NSMutableDictionary dictionaryWithDictionary:taskDict];
-            newTask[KEY_STATUS] = @(STATUS_RUNNING);
-            newTask[KEY_RESUMABLE] = @(NO);
-
-            _runningTaskById[newTaskId] = newTask;
-            [_runningTaskById removeObjectForKey:taskId];
-        }
-
-        [weakSelf updateTask:taskId newTaskId:newTaskId status:STATUS_RUNNING resumable:NO];
-        [weakSelf sendUpdateProgressForTaskId:newTaskId
-                                     inStatus:@(STATUS_RUNNING)
-                                  andProgress:taskDict[KEY_PROGRESS]];
-        [weakSelf fd_postResumeNotificationForTaskId:newTaskId];
-    });
+    // ✅ No notification actions in this build
 }
 
 - (void)handleMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
@@ -1459,52 +1390,14 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
 didReceiveNotificationResponse:(UNNotificationResponse *)response
          withCompletionHandler:(void (^)(void))completionHandler {
-
-    NSLog(@"[FD] ACTION tapped: %@  category=%@  userInfo=%@",
-      response.actionIdentifier,
-      response.notification.request.content.categoryIdentifier,
-      response.notification.request.content.userInfo);
-
-    NSDictionary *info = response.notification.request.content.userInfo;
-    NSString *taskId = [self fd_taskIdFromUserInfo:info];
-    NSString *action = response.actionIdentifier;
-
-    if (debug) NSLog(@"[FD] didReceiveNotificationResponse action=%@ taskId=%@", action, taskId);
-
-    if (taskId.length == 0) { if (completionHandler) completionHandler(); return; }
-
-        if ([action isEqualToString:FDActionPause]) {
-
-        // 1) Update notification immediately so iOS doesn't "dismiss and vanish" it
-        NSDictionary *t = [self loadTaskWithId:taskId];
-        double pct = 0;
-        if (t && t[@"progress"]) {
-            pct = [t[@"progress"] doubleValue];
-        }
-        [self fd_updatePausedNotificationForTaskId:taskId progress:pct];
-
-        // 2) Then perform actual pause
-        [self pauseTaskWithId:taskId];
-
-    } else if ([action isEqualToString:FDActionResume]) {
-
-        // 1) Update notification immediately so it flips back to running UI
-        NSDictionary *t = [self loadTaskWithId:taskId];
-        double pct = 0;
-        if (t && t[@"progress"]) {
-            pct = [t[@"progress"] doubleValue];
-        }
-        [self fd_updateRunningNotificationForTaskId:taskId progress:pct];
-
-        // 2) Then resume
-        [self resumeTaskWithIdFromNotification:taskId];
-
-    } else if ([action isEqualToString:FDActionCancel]) {
-        [self cancelTaskWithId:taskId];
+    if (debug) {
+        NSLog(@"[FD] Notification tapped. Ignoring actions. action=%@ category=%@ userInfo=%@",
+              response.actionIdentifier,
+              response.notification.request.content.categoryIdentifier,
+              response.notification.request.content.userInfo);
     }
 
     if (completionHandler) completionHandler();
-
 }
 
 // Show a banner only once per task while the app is in foreground.
