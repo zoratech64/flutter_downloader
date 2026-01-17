@@ -123,6 +123,11 @@
         if (debug) {
             NSLog(@"open DB successfully");
         }
+        sqlite3_busy_timeout(sqlite3Database, 5000);
+
+        // ✅ Reduce read/write contention
+        sqlite3_exec(sqlite3Database, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+        sqlite3_exec(sqlite3Database, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
 
         // Declare a sqlite3_stmt object in which will be stored the query after having been compiled into a SQLite statement.
         sqlite3_stmt *compiledStatement;

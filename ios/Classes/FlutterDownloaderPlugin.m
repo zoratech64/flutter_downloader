@@ -508,8 +508,21 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 {
     NSString *savedDir = dict[KEY_SAVED_DIR];
     NSString *filename = dict[KEY_FILE_NAME];
-    NSURL *savedDirURL = [NSURL fileURLWithPath:savedDir];
-    return [savedDirURL URLByAppendingPathComponent:filename];
+    if ((id)savedDir == [NSNull null] || savedDir == nil || [savedDir isEqualToString:NULL_VALUE]) {
+        savedDir = @"";
+    }
+
+    NSString *base = [self absoluteSavedDirPath:savedDir];
+    if (base == nil || base.length == 0) {
+        base = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    }
+
+    NSURL *savedDirURL = [NSURL fileURLWithPath:base];
+    if ((id)filename == [NSNull null] || filename == nil || [filename isEqualToString:NULL_VALUE]) {
+        filename = @"";
+    }
+
+    return filename.length ? [savedDirURL URLByAppendingPathComponent:filename] : savedDirURL;
 }
 
 - (NSURL*)fileUrlOf:(NSString*)taskId taskInfo:(NSDictionary*)taskInfo downloadTask:(NSURLSessionDownloadTask*)downloadTask {
@@ -545,7 +558,16 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 }
 
 - (NSString*)absoluteSavedDirPath:(NSString*)savedDir {
-    return [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject] stringByAppendingPathComponent:savedDir];
+    NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    if (savedDir == nil || savedDir.length == 0 || [savedDir isEqualToString:NULL_VALUE]) {
+        return doc;
+    }
+
+    if ([savedDir hasPrefix:@"/"]) {
+        return savedDir;
+    }
+
+    return [doc stringByAppendingPathComponent:savedDir];
 }
 
 - (NSString*)shortenSavedDirPath:(NSString*)absolutePath {
@@ -679,7 +701,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     @try {
         NSString *taskId = [record objectAtIndex:[_dbManager.arrColumnNames indexOfObject:@"task_id"]];
         int status = [[record objectAtIndex:[_dbManager.arrColumnNames indexOfObject:@"status"]] intValue];
-        int progress = [[record objectAtIndex:[_dbManager.arrColumnNames indexOfObject:@"progress"]] intValue];
+        double progress = [[record objectAtIndex:[_dbManager.arrColumnNames indexOfObject:@"progress"]] doubleValue];
         NSString *url = [record objectAtIndex:[_dbManager.arrColumnNames indexOfObject:@"url"]];
         NSString *filename = [record objectAtIndex:[_dbManager.arrColumnNames indexOfObject:@"file_name"]];
         NSString *savedDir = [self absoluteSavedDirPath:[record objectAtIndex:[_dbManager.arrColumnNames indexOfObject:@"saved_dir"]]];
@@ -1075,41 +1097,44 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     }
     
     NSString *taskId = [self identifierForTask:downloadTask];
-    int progress = 0;
+    double progress = 0.0;
     if (totalBytesExpectedToWrite > 0) {
-        progress = (int)round((double)totalBytesWritten * 100.0 / (double)totalBytesExpectedToWrite);
+        progress = ((double)totalBytesWritten * 100.0 / (double)totalBytesExpectedToWrite);
     } else {
-        // When size unknown, show 50..99% as "working" while data flows.
-        progress = (totalBytesWritten > 0) ? 50 : 0;
+        progress = (totalBytesWritten > 0) ? 50.0 : 0.0;
     }
+    progress = round(progress * 100.0) / 100.0;
     
     @synchronized(self) {
         NSNumber *lastProgress = _runningTaskById[taskId][KEY_PROGRESS];
-        if (([lastProgress intValue] == 0 || (progress > [lastProgress intValue] + _step) || progress == 100) && progress != [lastProgress intValue]) {
+        double last = lastProgress ? [lastProgress doubleValue] : -1.0;
+
+        if (last < 0 || progress >= last + (_step / 1.0) || progress >= 100.0) {
             _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
+
+            // ✅ send double progress to Flutter
             [self sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_RUNNING) andProgress:@(progress)];
-            
+
             __weak typeof(self) weakSelf = self;
             dispatch_async(self.databaseQueue, ^{
+                // keep DB as double or int; either is ok
                 [weakSelf updateTask:taskId status:STATUS_RUNNING progress:progress];
             });
 
-            double pct = (totalBytesExpectedToWrite > 0)
-            ? ((double)totalBytesWritten * 100.0 / (double)totalBytesExpectedToWrite)
-            : -1; // unknown size → textual “Downloading…” is fine
-            [self fd_updateRunningNotificationForTaskId:taskId progress:pct];
+            [self fd_updateRunningNotificationForTaskId:taskId progress:progress];
 
-            // Throttle notifications (no banner spam). We always "update" the same card.
+            // notification text (use %.2f)
             NSTimeInterval now = [NSDate date].timeIntervalSince1970;
             NSMutableDictionary *t = [self fd_taskInfoForId:taskId];
             NSTimeInterval lastNotify = t[@"lastNotify"] ? [t[@"lastNotify"] doubleValue] : 0;
-            if ((now - lastNotify) >= 0.8 || progress == 100) {
+            if ((now - lastNotify) >= 0.8 || progress >= 100.0) {
                 t[@"lastNotify"] = @(now);
                 NSString *body = (totalBytesExpectedToWrite > 0)
-                                 ? [NSString stringWithFormat:@"Downloading — %d%%", progress]
-                                 : @"Downloading…";
+                ? [NSString stringWithFormat:@"Downloading — %.2f%%", progress]
+                : @"Downloading…";
+
                 [[FDNotificationCenter shared] postOrUpdateForTaskId:taskId
-                                                               title:[self fd_titleForTaskId:taskId]
+                                                            title:[self fd_titleForTaskId:taskId]
                                                                 body:body
                                                             category:FDCategoryRunning
                                                             userInfo:@{ @"taskId": taskId }
@@ -1197,7 +1222,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 
     @synchronized(self) { [_runningTaskById removeObjectForKey:taskId]; }
 
-    [self sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_COMPLETE) andProgress:@100];
+    [self sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_COMPLETE) andProgress:@(100.0)];
     dispatch_async(self.databaseQueue, ^{
         [self updateTask:taskId status:STATUS_COMPLETE progress:100];
     });
