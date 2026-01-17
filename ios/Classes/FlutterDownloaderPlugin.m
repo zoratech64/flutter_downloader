@@ -549,12 +549,27 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 }
 
 - (NSString*)shortenSavedDirPath:(NSString*)absolutePath {
-    if (absolutePath) {
-        NSString* documentDirPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        if ([absolutePath hasPrefix:documentDirPath]) {
-            return [absolutePath substringFromIndex:documentDirPath.length + 1];
+    if (absolutePath.length == 0) return absolutePath;
+
+    NSString *documentDirPath =
+        [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+
+    if (documentDirPath.length == 0) return absolutePath;
+
+    if ([absolutePath hasPrefix:documentDirPath]) {
+        if (absolutePath.length == documentDirPath.length) {
+            return @"";
+        }
+
+        NSUInteger start = documentDirPath.length;
+        if ([absolutePath characterAtIndex:start] == '/') {
+            start += 1;
+        }
+        if (start <= absolutePath.length) {
+            return [absolutePath substringFromIndex:start];
         }
     }
+
     return absolutePath;
 }
 
