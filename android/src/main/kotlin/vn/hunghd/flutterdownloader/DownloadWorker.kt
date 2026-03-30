@@ -102,7 +102,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
 
     // --- Track pause/cancel state ---
     private var isPaused = false
-    private var isStopped = false
+    private var isManuallyStopped = false
 
     // BroadcastReceiver for “Pause / Resume / Cancel” button clicks in the notification
     private val downloadActionReceiver = object : BroadcastReceiver() {
@@ -533,7 +533,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         // If 200 (OK) or 206 (Partial) and not canceled
         if ((responseCode == HttpURLConnection.HTTP_OK
                     || (isResume && responseCode == HttpURLConnection.HTTP_PARTIAL))
-            && !isStopped
+            && !(isManuallyStopped || isStopped)
         ) {
             val contentType: String? = httpConn.contentType
             val contentLength: Long = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N)
@@ -630,7 +630,7 @@ val savedFilePath = savedFile.path
             val buffer = ByteArray(BUFFER_SIZE)
 
             while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                if (isStopped) {
+                if (isManuallyStopped || isStopped) {
                     log("Download stopped (paused or canceled)")
                     break
                 }
@@ -689,8 +689,9 @@ val savedFilePath = savedFile.path
 
             // Determine final status + progress
             val loadedTask = taskDao?.loadTask(id.toString())
-            val finalProgress = if (isStopped && loadedTask!!.resumable) lastProgress else 100.0
-            val finalStatus = if (isStopped) {
+            val wasStopped = isManuallyStopped || isStopped
+            val finalProgress = if (wasStopped && loadedTask!!.resumable) lastProgress else 100.0
+            val finalStatus = if (wasStopped) {
                 if (loadedTask?.resumable == true) DownloadStatus.PAUSED else DownloadStatus.CANCELED
             } else {
                 DownloadStatus.COMPLETE
@@ -784,11 +785,12 @@ val savedFilePath = savedFile.path
             )
             // Final callback under the correct ID
             sendProgress(finalStatus, finalProgress)
-            log(if (isStopped) "Download canceled/paused" else "Download complete")
+            log(if (wasStopped) "Download canceled/paused" else "Download complete")
         } else {
             // Canceled or unexpected response code
             val loadedTask = taskDao!!.loadTask(id.toString())
-            val status = if (isStopped)
+            val wasStopped = isManuallyStopped || isStopped
+            val status = if (wasStopped)
                 if (loadedTask?.resumable == true) DownloadStatus.PAUSED else DownloadStatus.CANCELED
             else
                 DownloadStatus.FAILED
@@ -804,7 +806,7 @@ val savedFilePath = savedFile.path
             )
             sendProgress(status, -1.0)
             log(
-                if (isStopped) "Download canceled/paused"
+                if (wasStopped) "Download canceled/paused"
                 else "HTTP $responseCode, marked FAILED"
             )
         }
@@ -1331,7 +1333,7 @@ val cancelPendingIntent = PendingIntent.getBroadcast(
         if (!isPaused) {
             log("Pausing download")
             isPaused = true
-            isStopped = true
+            isManuallyStopped = true
             taskDao?.updateTaskResumable(id.toString(), true)
             taskDao?.updateTask(id.toString(), DownloadStatus.PAUSED, lastProgress)
             val task = taskDao?.loadTask(id.toString())
@@ -1483,7 +1485,7 @@ private fun resumeDownload(intent: Intent) {
     private fun cancelDownload() {
         log("Canceling download")
         isPaused = false
-        isStopped = true
+        isManuallyStopped = true
         taskDao?.updateTaskResumable(id.toString(), false)
 
         val task = taskDao?.loadTask(id.toString())

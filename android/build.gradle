@@ -26,7 +26,7 @@ apply plugin: "org.jlleitschuh.gradle.ktlint"
 
 android {
     namespace = "vn.hunghd.flutterdownloader"
-    compileSdk = 35
+    compileSdk = 36
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
@@ -45,7 +45,7 @@ android {
 
     defaultConfig {
         minSdk = 21
-        targetSdk = 35
+        targetSdk = 36
     }
 }
 

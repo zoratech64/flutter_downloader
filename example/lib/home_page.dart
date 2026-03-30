@@ -10,6 +10,21 @@ import 'package:flutter_downloader_example/download_list_item.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+@pragma('vm:entry-point')
+void downloadCallback(
+  String id,
+  int status,
+  double progress,
+) {
+  print(
+    'Callback on background isolate: '
+    'task ($id) is in status ($status) and process ($progress)',
+  );
+
+  IsolateNameServer.lookupPortByName('downloader_send_port')
+      ?.send([id, status, progress]);
+}
+
 class MyHomePage extends StatefulWidget with WidgetsBindingObserver {
   const MyHomePage({super.key, required this.title, required this.platform});
 
@@ -92,21 +107,6 @@ class _MyHomePageState extends State<MyHomePage> {
 
   void _unbindBackgroundIsolate() {
     IsolateNameServer.removePortNameMapping('downloader_send_port');
-  }
-
-  @pragma('vm:entry-point')
-  static void downloadCallback(
-    String id,
-    int status,
-    double progress,
-  ) {
-    print(
-      'Callback on background isolate: '
-      'task ($id) is in status ($status) and process ($progress)',
-    );
-
-    IsolateNameServer.lookupPortByName('downloader_send_port')
-        ?.send([id, status, progress]);
   }
 
   Widget _buildDownloadList() {

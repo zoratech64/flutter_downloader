@@ -244,6 +244,11 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
 
     private fun cancel(call: MethodCall, result: MethodChannel.Result) {
         val taskId: String = call.requireArgument("task_id")
+        val cancelIntent = Intent(DownloadWorker.ACTION_CANCEL).apply {
+            setPackage(requireContext().packageName)
+            putExtra("TASK_ID", taskId)
+        }
+        requireContext().sendBroadcast(cancelIntent)
         WorkManager.getInstance(requireContext()).cancelWorkById(UUID.fromString(taskId))
         result.success(null)
     }
@@ -402,6 +407,11 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
     val task                = taskDao!!.loadTask(taskId)
 
     if (task != null) {
+        val cancelIntent = Intent(DownloadWorker.ACTION_CANCEL).apply {
+            setPackage(requireContext().packageName)
+            putExtra("TASK_ID", taskId)
+        }
+        requireContext().sendBroadcast(cancelIntent)
         if (task.status == DownloadStatus.ENQUEUED || task.status == DownloadStatus.RUNNING) {
             WorkManager.getInstance(requireContext())
                        .cancelWorkById(UUID.fromString(taskId))
