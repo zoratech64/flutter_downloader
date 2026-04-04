@@ -104,6 +104,9 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
     private var isPaused = false
     private var isManuallyStopped = false
 
+    private fun effectiveTaskId(): String =
+        inputData.getString("OLD_TASK_ID") ?: id.toString()
+
     // BroadcastReceiver for “Pause / Resume / Cancel” button clicks in the notification
     private val downloadActionReceiver = object : BroadcastReceiver() {
     override fun onReceive(context: Context?, intent: Intent?) {
@@ -215,9 +218,10 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         val context: Context = applicationContext
         dbHelper = TaskDbHelper.getInstance(context)
         taskDao = TaskDao(dbHelper!!)
+        val taskId = effectiveTaskId()
         val url: String? = inputData.getString(ARG_URL)
         val filename: String? = inputData.getString(ARG_FILE_NAME)
-        val task = taskDao?.loadTask(id.toString())
+        val task = taskDao?.loadTask(taskId)
         if (task != null && task.status == DownloadStatus.ENQUEUED) {
             updateNotification(
                 context,
@@ -227,7 +231,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 null,
                 true
             )
-            taskDao?.updateTask(id.toString(), DownloadStatus.CANCELED, lastProgress)
+            taskDao?.updateTask(taskId, DownloadStatus.CANCELED, lastProgress)
         }
         super.onStopped()
     }
@@ -269,7 +273,8 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         downloadStartTime = System.currentTimeMillis()
         lastUpdateTime = downloadStartTime
 
-        val task = taskDao?.loadTask(id.toString())
+        val taskId = effectiveTaskId()
+        val task = taskDao?.loadTask(taskId)
         log(
             "DownloadWorker{url=$url,filename=$filename,savedDir=$savedDir,header=$headers,isResume=$isResume,status="
                     + (task?.status ?: "GONE") +
@@ -300,13 +305,13 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
             null,
             false
         )
-        taskDao?.updateTask(id.toString(), DownloadStatus.RUNNING, task.progress)
+        taskDao?.updateTask(taskId, DownloadStatus.RUNNING, task.progress)
 
         // If a partial file already exists, mark it resumable in the database
         val saveFilePath = savedDir + File.separator + filename
         val partialFile = File(saveFilePath)
         if (partialFile.exists()) {
-            taskDao?.updateTaskResumable(id.toString(), true)
+            taskDao?.updateTaskResumable(taskId, true)
             log("Partial file exists for $filename; automatic resume next time.")
         }
 
@@ -337,7 +342,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
                 null,
                 true
             )
-            taskDao?.updateTask(id.toString(), DownloadStatus.FAILED, lastProgress)
+            taskDao?.updateTask(taskId, DownloadStatus.FAILED, lastProgress)
             e.printStackTrace()
             dbHelper = null
             taskDao = null
@@ -418,10 +423,11 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
 
     // 0) Grab the “old” task ID (if this is a resume) so we can keep sending progress under that ID.
     val oldTaskId: String? = inputData.getString("OLD_TASK_ID")
+    val taskId = effectiveTaskId()
 
     // Helper that sends progress using either oldTaskId or the new WorkRequest ID
     fun sendProgress(status: DownloadStatus, progress: Double) {
-        val taskIdToUse = oldTaskId ?: id.toString()
+        val taskIdToUse = oldTaskId ?: taskId
         val callbackHandle: Long = inputData.getLong(ARG_CALLBACK_HANDLE, 0L)
         val args = listOf<Any>(callbackHandle, taskIdToUse, status.ordinal, progress)
         synchronized(isolateStarted) {
@@ -437,7 +443,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
 
     try {
         // Load current progress from DB (for lastProgress)
-        val task = taskDao?.loadTask(id.toString())
+        val task = taskDao?.loadTask(effectiveTaskId())
         if (task != null) {
             lastProgress = task.progress
         }
@@ -518,7 +524,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         // If server returns 416, treat as “complete”
         if (isResume && responseCode == 416) {
             log("Server responded 416 (Range Not Satisfiable); marking task as COMPLETE.")
-            taskDao?.updateTask(id.toString(), DownloadStatus.COMPLETE, 100.0)
+            taskDao?.updateTask(taskId, DownloadStatus.COMPLETE, 100.0)
             updateNotification(
                 context,
                 actualFilename,
@@ -572,7 +578,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
 log("Resolved filename = $actualFilename")
 
 // ─── Update database with "final" name before opening streams ───
-taskDao?.updateTask(id.toString(), actualFilename, contentType)
+taskDao?.updateTask(taskId, actualFilename, contentType)
 inputStream = httpConn.inputStream
 
 // ─── Build outputStream: ───
@@ -613,7 +619,7 @@ if (isResume) {
     actualFilename = finalFilename
 
     // ─ Update DB with the adjusted filename ─
-    taskDao?.updateTask(id.toString(), actualFilename, contentType)
+    taskDao?.updateTask(taskId, actualFilename, contentType)
 
     // ─ Finally create the brand‐new file on disk ─
     val created = candidateFile.createNewFile()
@@ -674,7 +680,7 @@ val savedFilePath = savedFile.path
 
                     val progressText = "$speedText · $timeText"
 
-                    taskDao!!.updateTask(id.toString(), DownloadStatus.RUNNING, progress)
+                    taskDao!!.updateTask(taskId, DownloadStatus.RUNNING, progress)
                     updateNotification(
                         context,
                         actualFilename,
@@ -690,7 +696,7 @@ val savedFilePath = savedFile.path
             }
 
             // Determine final status + progress
-            val loadedTask = taskDao?.loadTask(id.toString())
+            val loadedTask = taskDao?.loadTask(taskId)
             val wasStopped = isManuallyStopped || isStopped
             val finalProgress = if (wasStopped && loadedTask!!.resumable) lastProgress else 100.0
             val finalStatus = if (wasStopped) {
@@ -776,7 +782,7 @@ val savedFilePath = savedFile.path
                 }
             }
 
-            taskDao!!.updateTask(id.toString(), finalStatus, finalProgress)
+            taskDao!!.updateTask(taskId, finalStatus, finalProgress)
             updateNotification(
                 context,
                 actualFilename,
@@ -790,14 +796,14 @@ val savedFilePath = savedFile.path
             log(if (wasStopped) "Download canceled/paused" else "Download complete")
         } else {
             // Canceled or unexpected response code
-            val loadedTask = taskDao!!.loadTask(id.toString())
+            val loadedTask = taskDao!!.loadTask(taskId)
             val wasStopped = isManuallyStopped || isStopped
             val status = if (wasStopped)
                 if (loadedTask?.resumable == true) DownloadStatus.PAUSED else DownloadStatus.CANCELED
             else
                 DownloadStatus.FAILED
 
-            taskDao!!.updateTask(id.toString(), status, lastProgress)
+            taskDao!!.updateTask(taskId, status, lastProgress)
             updateNotification(
                 context,
                 filename ?: fileURL,
@@ -816,7 +822,7 @@ val savedFilePath = savedFile.path
         if (!isNetworkAvailable()) {
         // Treat loss of connectivity as a pause
         log("Network lost: pausing download")
-        taskDao!!.updateTask(id.toString(), DownloadStatus.PAUSED, lastProgress)
+        taskDao!!.updateTask(taskId, DownloadStatus.PAUSED, lastProgress)
         updateNotification(
             context,
             filename ?: fileURL.substringAfterLast("/"),
@@ -829,7 +835,7 @@ val savedFilePath = savedFile.path
     } else {
         // Some other I/O error → real failure
         logError("Download error: ${e.message}")
-        taskDao!!.updateTask(id.toString(), DownloadStatus.FAILED, lastProgress)
+        taskDao!!.updateTask(taskId, DownloadStatus.FAILED, lastProgress)
         updateNotification(
             context,
             filename ?: "Download failed",
@@ -1011,7 +1017,7 @@ private fun findExistingDownloadUri(fileName: String): Uri? {
      * Remove any partial file if the final status is not COMPLETE and “resumable=false”.
      */
     private fun cleanUp() {
-        val task = taskDao?.loadTask(id.toString()) ?: return
+        val task = taskDao?.loadTask(effectiveTaskId()) ?: return
         if (task.status != DownloadStatus.COMPLETE && !task.resumable) {
             var filename = task.filename
             if (filename == null) {
@@ -1339,9 +1345,10 @@ val cancelPendingIntent = PendingIntent.getBroadcast(
             log("Pausing download")
             isPaused = true
             isManuallyStopped = true
-            taskDao?.updateTaskResumable(id.toString(), true)
-            taskDao?.updateTask(id.toString(), DownloadStatus.PAUSED, lastProgress)
-            val task = taskDao?.loadTask(id.toString())
+            val taskId = effectiveTaskId()
+            taskDao?.updateTaskResumable(taskId, true)
+            taskDao?.updateTask(taskId, DownloadStatus.PAUSED, lastProgress)
+            val task = taskDao?.loadTask(taskId)
             var filename: String? = null
             if (task != null) {
                 filename = task.filename ?: task.url.substring(task.url.lastIndexOf("/") + 1)
@@ -1452,10 +1459,10 @@ private fun resumeDownload(intent: Intent) {
 
     val newTaskId = newWork.id.toString()
 
-    // 9) Overwrite that same DB row so “task_id → newTaskId, status=RUNNING, progress=originalProgress, resumable=false”
+    // 9) Keep the original task_id stable (app still references it); just update status/progress/resumable
     taskDao!!.updateTask(
         /* currentTaskId = */ pausedTaskId,
-        /* newTaskId     = */ newTaskId,
+        /* newTaskId     = */ pausedTaskId,
         /* status        = */ DownloadStatus.RUNNING,
         /* progress      = */ originalProgress,
         /* resumable     = */ false
@@ -1491,9 +1498,10 @@ private fun resumeDownload(intent: Intent) {
         log("Canceling download")
         isPaused = false
         isManuallyStopped = true
-        taskDao?.updateTaskResumable(id.toString(), false)
+        val taskId = effectiveTaskId()
+        taskDao?.updateTaskResumable(taskId, false)
 
-        val task = taskDao?.loadTask(id.toString())
+        val task = taskDao?.loadTask(taskId)
         var filename: String? = null
         if (task != null) {
             filename = task.filename
@@ -1507,7 +1515,7 @@ private fun resumeDownload(intent: Intent) {
                 log("Deleted partial file on cancel: $saveFilePath → $deleted")
             }
         }
-        taskDao?.updateTask(id.toString(), DownloadStatus.CANCELED, lastProgress)
+        taskDao?.updateTask(taskId, DownloadStatus.CANCELED, lastProgress)
         updateNotification(
             applicationContext,
             filename ?: "Download canceled",
