@@ -4,6 +4,7 @@
 #import "FDNotificationCenter.h"
 #import "FDNotificationActionHandler.h"
 #import <UIKit/UIKit.h>
+#import <math.h>
 
 #define STATUS_UNDEFINED 0
 #define STATUS_ENQUEUED 1
@@ -1097,11 +1098,19 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
     }
     
     NSString *taskId = [self identifierForTask:downloadTask];
-    double progress = 0.0;
+    double rawProgress = 0.0;
     if (totalBytesExpectedToWrite > 0) {
-        progress = ((double)totalBytesWritten * 100.0 / (double)totalBytesExpectedToWrite);
+        rawProgress = ((double)totalBytesWritten * 100.0 / (double)totalBytesExpectedToWrite);
     } else {
-        progress = (totalBytesWritten > 0) ? 50.0 : 0.0;
+        rawProgress = (totalBytesWritten > 0) ? 50.0 : 0.0;
+    }
+    double progress = rawProgress;
+    if (_step > 0) {
+        double stepSize = (double)_step;
+        progress = floor(rawProgress / stepSize) * stepSize;
+    }
+    if (rawProgress >= 100.0) {
+        progress = 100.0;
     }
     progress = round(progress * 100.0) / 100.0;
     
@@ -1109,7 +1118,8 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
         NSNumber *lastProgress = _runningTaskById[taskId][KEY_PROGRESS];
         double last = lastProgress ? [lastProgress doubleValue] : -1.0;
 
-        if (last < 0 || progress >= last + (_step / 1.0) || progress >= 100.0) {
+        double effectiveStep = (_step > 0) ? (double)_step : 0.0;
+        if ((last < 0 || progress >= last + effectiveStep || progress >= 100.0) && progress != last) {
             _runningTaskById[taskId][KEY_PROGRESS] = @(progress);
 
             // ✅ send double progress to Flutter

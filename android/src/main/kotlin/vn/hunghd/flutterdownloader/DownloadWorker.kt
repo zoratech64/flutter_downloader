@@ -50,6 +50,7 @@ import javax.net.ssl.X509TrustManager
 import java.util.concurrent.TimeUnit
 import java.util.UUID
 import android.net.ConnectivityManager
+import kotlin.math.floor
 
 /**
  * DownloadWorker.kt
@@ -363,6 +364,16 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         }
     }
 
+    private fun quantizeProgress(rawProgress: Double): Double {
+        val clamped = rawProgress.coerceIn(0.0, 100.0)
+        if (step <= 0) {
+            return clamped
+        }
+        val stepSize = step.toDouble()
+        val quantized = floor(clamped / stepSize) * stepSize
+        return if (clamped >= 100.0) 100.0 else quantized
+    }
+
     /**
      * If isResume==true, add an HTTP “Range: bytes=${downloaded}-” header to pick up
      * from where we left off.
@@ -437,7 +448,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         // Load current progress from DB (for lastProgress)
         val task = taskDao?.loadTask(id.toString())
         if (task != null) {
-            lastProgress = task.progress
+            lastProgress = quantizeProgress(task.progress)
         }
 
         // 1) Follow redirects up to 3×
@@ -635,11 +646,13 @@ val savedFilePath = savedFile.path
                     break
                 }
                 count += bytesRead.toLong()
-                val progress =
+                val rawProgress =
                     (count * 100.0 / (contentLength + downloadedBytes)).coerceAtMost(100.0)
+                val progress = quantizeProgress(rawProgress)
                 outputStream?.write(buffer, 0, bytesRead)
 
-                if ((lastProgress == 0.0 || progress > lastProgress + step || progress == 100.0)
+                val effectiveStep = if (step <= 0) 0.0 else step.toDouble()
+                if ((lastProgress == 0.0 || progress >= lastProgress + effectiveStep || progress >= 100.0)
                     && progress != lastProgress
                 ) {
                     lastProgress = progress
