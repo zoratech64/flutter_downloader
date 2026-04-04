@@ -110,8 +110,10 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         if (intent == null) return
         // Grab the TASK_ID extra from the incoming broadcast:
         val sentTaskId = intent.getStringExtra("TASK_ID")
-        // Only proceed if this worker’s id matches:
-        if (sentTaskId != id.toString()) return
+        val currentTaskId = id.toString()
+        val oldTaskId = inputData.getString("OLD_TASK_ID")
+        // Only proceed if this worker’s id matches (or it was resumed from notification)
+        if (sentTaskId != currentTaskId && sentTaskId != oldTaskId) return
 
         when (intent.action) {
             ACTION_PAUSE  -> pauseDownload()
@@ -1084,6 +1086,8 @@ private fun findExistingDownloadUri(fileName: String): Uri? {
 
         if (!showNotification) return
 
+        val effectiveTaskId = inputData.getString("OLD_TASK_ID") ?: id.toString()
+
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setContentTitle(title)
             .setContentIntent(intent)
@@ -1094,15 +1098,15 @@ private fun findExistingDownloadUri(fileName: String): Uri? {
         // Prepare “Pause,” “Resume,” “Cancel” PendingIntents:
 val pauseIntent = Intent(ACTION_PAUSE).apply {
     setPackage(context.packageName)
-    putExtra("TASK_ID", id.toString())
+    putExtra("TASK_ID", effectiveTaskId)
 }
 val resumeIntent = Intent(ACTION_RESUME).apply {
     setPackage(context.packageName)
-    putExtra("TASK_ID", id.toString())
+    putExtra("TASK_ID", effectiveTaskId)
 }
 val cancelIntent = Intent(ACTION_CANCEL).apply {
     setPackage(context.packageName)
-    putExtra("TASK_ID", id.toString())
+    putExtra("TASK_ID", effectiveTaskId)
 }
 
         val idCode = id.toString().hashCode()   // or use task.primaryId
@@ -1252,8 +1256,9 @@ val cancelPendingIntent = PendingIntent.getBroadcast(
     private fun sendUpdateProcessEvent(status: DownloadStatus, progress: Double) {
         val args: MutableList<Any> = ArrayList()
         val callbackHandle: Long = inputData.getLong(ARG_CALLBACK_HANDLE, 0)
+        val effectiveTaskId = inputData.getString("OLD_TASK_ID") ?: id.toString()
         args.add(callbackHandle)
-        args.add(id.toString())
+        args.add(effectiveTaskId)
         args.add(status.ordinal)
         args.add(progress)
         synchronized(isolateStarted) {
@@ -1463,7 +1468,7 @@ private fun resumeDownload(intent: Intent) {
     Handler(applicationContext.mainLooper).post {
         backgroundChannel?.invokeMethod(
             "updateProgress",
-            listOf(callbackHandle, newTaskId, DownloadStatus.RUNNING.ordinal, originalProgress)
+            listOf(callbackHandle, pausedTaskId, DownloadStatus.RUNNING.ordinal, originalProgress)
         )
     }
 
