@@ -413,9 +413,11 @@ class FlutterDownloader {
   ///  send.send([id, status, progress]);
   ///}
   ///```
+  ///
+  /// Use smaller step values (e.g. `0.1`) for smoother progress updates.
   static Future<void> registerCallback(
     DownloadCallback callback, {
-    int step = 10,
+    num step = 10,
   }) async {
     assert(_initialized, 'plugin flutter_downloader is not initialized');
 
@@ -425,14 +427,16 @@ class FlutterDownloader {
       'callback must be a top-level or static function',
     );
 
+    final stepValue = step.toDouble();
+
     assert(
-      0 <= step && step <= 100,
+      0 <= stepValue && stepValue <= 100,
       'step size is not in the inclusive <0;100> range',
     );
 
     await _channel.invokeMethod<void>(
       'registerCallback',
-      <dynamic>[callbackHandle!.toRawHandle(), step],
+      <dynamic>[callbackHandle!.toRawHandle(), stepValue],
     );
   }
 

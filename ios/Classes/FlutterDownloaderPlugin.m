@@ -64,7 +64,7 @@ static BOOL debug = YES;
 static NSURLSession *_session = nil;
 static FlutterEngine *_headlessRunner = nil;
 static int64_t _callbackHandle = 0;
-static int _step = 10;
+static double _step = 10.0;
 static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = nil;
 
 @synthesize databaseQueue;
@@ -751,7 +751,7 @@ static FlutterDownloaderPlugin *_sharedInstance = nil;
 - (void)registerCallbackMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
     NSArray *arguments = call.arguments;
     _callbackHandle = [arguments[0] longLongValue];
-    _step = [arguments[1] intValue];
+    _step = [arguments[1] doubleValue];
     if (initialized) [self unqueueStatusEvents];
     result(nil);
 }

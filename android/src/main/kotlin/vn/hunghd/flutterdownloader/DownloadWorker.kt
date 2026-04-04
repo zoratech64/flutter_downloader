@@ -51,6 +51,7 @@ import java.util.concurrent.TimeUnit
 import java.util.UUID
 import android.net.ConnectivityManager
 import kotlin.math.floor
+import kotlin.math.round
 
 /**
  * DownloadWorker.kt
@@ -93,7 +94,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
     private var msgPaused: String? = null
     private var msgComplete: String? = null
     private var lastCallUpdateNotification: Long = 0
-    private var step = 0
+    private var step = 0.0
     private var saveInPublicStorage = false
 
     // Download speed / remaining time tracking
@@ -253,7 +254,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
         val isResume: Boolean = inputData.getBoolean(ARG_IS_RESUME, false)
         val timeout: Int = inputData.getInt(ARG_TIMEOUT, 15000)
         debug = inputData.getBoolean(ARG_DEBUG, false)
-        step = inputData.getInt(ARG_STEP, 10)
+        step = inputData.getDouble(ARG_STEP, 10.0)
         ignoreSsl = inputData.getBoolean(ARG_IGNORESSL, false)
 
         // Grab all of our localized strings from resources
@@ -366,12 +367,13 @@ class DownloadWorker(context: Context, params: WorkerParameters) :
 
     private fun quantizeProgress(rawProgress: Double): Double {
         val clamped = rawProgress.coerceIn(0.0, 100.0)
-        if (step <= 0) {
+        if (step <= 0.0) {
             return clamped
         }
-        val stepSize = step.toDouble()
+        val stepSize = step
         val quantized = floor(clamped / stepSize) * stepSize
-        return if (clamped >= 100.0) 100.0 else quantized
+        val rounded = round(quantized * 100.0) / 100.0
+        return if (clamped >= 100.0) 100.0 else rounded
     }
 
     /**
@@ -651,7 +653,7 @@ val savedFilePath = savedFile.path
                 val progress = quantizeProgress(rawProgress)
                 outputStream?.write(buffer, 0, bytesRead)
 
-                val effectiveStep = if (step <= 0) 0.0 else step.toDouble()
+                val effectiveStep = if (step <= 0.0) 0.0 else step
                 if ((lastProgress == 0.0 || progress >= lastProgress + effectiveStep || progress >= 100.0)
                     && progress != lastProgress
                 ) {
@@ -1411,7 +1413,7 @@ private fun resumeDownload(intent: Intent) {
 
     // 5) Grab any “plugin-level” flags from inputData (callbackHandle, step, debug, etc.)
     val callbackHandle = inputData.getLong(ARG_CALLBACK_HANDLE, 0L)
-    val stepSize       = inputData.getInt(ARG_STEP, 10)
+    val stepSize       = inputData.getDouble(ARG_STEP, 10.0)
     val debugFlag      = inputData.getBoolean(ARG_DEBUG, false)
     val ignoreSslFlag  = inputData.getBoolean(ARG_IGNORESSL, false)
     val timeoutMs      = inputData.getInt(ARG_TIMEOUT, 15000)
@@ -1426,7 +1428,7 @@ private fun resumeDownload(intent: Intent) {
         .putBoolean(ARG_OPEN_FILE_FROM_NOTIFICATION, originalOpenFileFromNotif)
         .putBoolean(ARG_IS_RESUME, true)
         .putLong(ARG_CALLBACK_HANDLE, callbackHandle)
-        .putInt(ARG_STEP, stepSize)
+        .putDouble(ARG_STEP, stepSize)
         .putBoolean(ARG_DEBUG, debugFlag)
         .putBoolean(ARG_IGNORESSL, ignoreSslFlag)
         .putBoolean(ARG_SAVE_IN_PUBLIC_STORAGE, originalSaveInPublic)

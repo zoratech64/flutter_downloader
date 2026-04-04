@@ -37,7 +37,7 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
     private var taskDao: TaskDao? = null
     private var context: Context? = null
     private var callbackHandle: Long = 0
-    private var step = 0
+    private var step = 0.0
     private var debugMode = 0
     private var ignoreSsl = 0
     private val initializationLock = Any()
@@ -120,7 +120,7 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
                     )
                     .putBoolean(DownloadWorker.ARG_IS_RESUME, isResume)
                     .putLong(DownloadWorker.ARG_CALLBACK_HANDLE, callbackHandle)
-                    .putInt(DownloadWorker.ARG_STEP, step)
+                    .putDouble(DownloadWorker.ARG_STEP, step)
                     .putBoolean(DownloadWorker.ARG_DEBUG, debugMode == 1)
                     .putBoolean(DownloadWorker.ARG_IGNORESSL, ignoreSsl == 1)
                     .putBoolean(
@@ -155,7 +155,7 @@ class FlutterDownloaderPlugin : MethodChannel.MethodCallHandler, FlutterPlugin {
     private fun registerCallback(call: MethodCall, result: MethodChannel.Result) {
         val args = call.arguments as List<*>
         callbackHandle = args[0].toString().toLong()
-        step = args[1].toString().toInt()
+        step = args[1].toString().toDouble()
         result.success(null)
     }
 
